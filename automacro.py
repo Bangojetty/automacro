@@ -17,6 +17,7 @@ import math
 
 import customtkinter as ctk
 from PIL import Image, ImageDraw, ImageTk
+from pynput import keyboard as pynput_kb, mouse as pynput_mouse
 
 # ─── Windows SendInput Structures ────────────────────────────────────────────
 
@@ -218,6 +219,117 @@ class InputSimulator:
         InputSimulator._send([move, down, up])
 
 
+# ─── InputRecorder ───────────────────────────────────────────────────────────
+
+class InputRecorder:
+    """Capture live keyboard and mouse events and build an action list."""
+
+    # Map pynput special Key enum values to VK_MAP names
+    _PYNPUT_KEY_MAP = {
+        pynput_kb.Key.space: "SPACE",
+        pynput_kb.Key.enter: "ENTER",
+        pynput_kb.Key.tab: "TAB",
+        pynput_kb.Key.esc: "ESC",
+        pynput_kb.Key.backspace: "BACKSPACE",
+        pynput_kb.Key.delete: "DELETE",
+        pynput_kb.Key.insert: "INSERT",
+        pynput_kb.Key.home: "HOME",
+        pynput_kb.Key.end: "END",
+        pynput_kb.Key.page_up: "PAGEUP",
+        pynput_kb.Key.page_down: "PAGEDOWN",
+        pynput_kb.Key.up: "UP",
+        pynput_kb.Key.down: "DOWN",
+        pynput_kb.Key.left: "LEFT",
+        pynput_kb.Key.right: "RIGHT",
+        pynput_kb.Key.shift: "SHIFT",
+        pynput_kb.Key.shift_l: "LSHIFT",
+        pynput_kb.Key.shift_r: "RSHIFT",
+        pynput_kb.Key.ctrl: "CTRL",
+        pynput_kb.Key.ctrl_l: "LCTRL",
+        pynput_kb.Key.ctrl_r: "RCTRL",
+        pynput_kb.Key.alt: "ALT",
+        pynput_kb.Key.alt_l: "LALT",
+        pynput_kb.Key.alt_r: "RALT",
+        pynput_kb.Key.caps_lock: "CAPSLOCK",
+        pynput_kb.Key.num_lock: "NUMLOCK",
+        pynput_kb.Key.scroll_lock: "SCROLLLOCK",
+        **{getattr(pynput_kb.Key, f"f{i}", None): f"F{i}" for i in range(1, 13)},
+    }
+
+    def __init__(self, on_action=None, stop_key="F8"):
+        self._on_action = on_action  # callback(action: dict)
+        self._stop_key = stop_key.upper()
+        self._kb_listener = None
+        self._mouse_listener = None
+        self._last_time = None
+        self.recording = False
+
+    def start(self):
+        self.recording = True
+        self._last_time = time.monotonic()
+        self._kb_listener = pynput_kb.Listener(
+            on_press=self._on_key_press, suppress=False
+        )
+        self._mouse_listener = pynput_mouse.Listener(
+            on_click=self._on_mouse_click, suppress=False
+        )
+        self._kb_listener.start()
+        self._mouse_listener.start()
+
+    def stop(self):
+        self.recording = False
+        if self._kb_listener:
+            self._kb_listener.stop()
+            self._kb_listener = None
+        if self._mouse_listener:
+            self._mouse_listener.stop()
+            self._mouse_listener = None
+
+    def _elapsed_ms(self) -> int:
+        now = time.monotonic()
+        ms = int((now - self._last_time) * 1000)
+        self._last_time = now
+        return ms
+
+    def _emit(self, action: dict):
+        if self._on_action:
+            self._on_action(action)
+
+    def _on_key_press(self, key):
+        if not self.recording:
+            return
+        name = self._resolve_key(key)
+        if name is None:
+            return
+        delay = self._elapsed_ms()
+        if name.upper() == self._stop_key:
+            return  # stop key is handled by the app, ignore it here
+        self._emit({"type": "key", "key": name, "action": "tap", "delay": delay})
+
+    def _on_mouse_click(self, x, y, button, pressed):
+        if not self.recording or not pressed:
+            return
+        delay = self._elapsed_ms()
+        btn_name = "right" if button == pynput_mouse.Button.right else (
+            "middle" if button == pynput_mouse.Button.middle else "left"
+        )
+        self._emit({"type": "click", "x": x, "y": y, "button": btn_name, "delay": delay})
+
+    def _resolve_key(self, key) -> str | None:
+        # Special keys
+        name = self._PYNPUT_KEY_MAP.get(key)
+        if name:
+            return name
+        # Character keys
+        try:
+            char = key.char
+            if char and char.upper() in VK_MAP:
+                return char.upper()
+        except AttributeError:
+            pass
+        return None
+
+
 # ─── MacroEngine ─────────────────────────────────────────────────────────────
 
 class MacroEngine:
@@ -376,9 +488,11 @@ class AutoMacroApp(ctk.CTk):
         self.macro_name = "Untitled"
 
         self._recording_hotkey = False
+        self._input_recording = False
         self.engine = MacroEngine(on_status=self._on_engine_status,
                                    on_action=self._on_engine_action)
         self.hotkey_mgr = GlobalHotkeyManager(self.hotkey, self._toggle_macro)
+        self.recorder = InputRecorder(on_action=self._on_recorded_action, stop_key="F8")
 
         self._build_ui()
         self._create_overlay()
@@ -424,6 +538,12 @@ class AutoMacroApp(ctk.CTk):
                        command=self._dlg_add_click).pack(side="left", padx=(0, 5))
         ctk.CTkButton(btn_row, text="Add Delay", width=100,
                        command=self._dlg_add_delay).pack(side="left", padx=(0, 5))
+        self.record_input_btn = ctk.CTkButton(
+            btn_row, text="Record Inputs (F8)", width=150,
+            fg_color="#7b3fa0", hover_color="#9b52c4",
+            command=self._toggle_input_recording,
+        )
+        self.record_input_btn.pack(side="left", padx=(0, 5))
         ctk.CTkButton(btn_row, text="Clear All", width=90, fg_color="#aa3333",
                        hover_color="#cc4444",
                        command=self._clear_actions).pack(side="right")
@@ -729,6 +849,41 @@ class AutoMacroApp(ctk.CTk):
             repeat = 0 if self.infinite_var.get() else int(self.repeat_var.get() or 1)
             self.engine.start(list(self.actions), repeat)
 
+    def _toggle_input_recording(self):
+        if self._input_recording:
+            self._stop_input_recording()
+        else:
+            self._start_input_recording()
+
+    def _start_input_recording(self):
+        self._input_recording = True
+        self.recorder.start()
+        self.record_input_btn.configure(
+            text="Stop Recording (F8)", fg_color="#c0392b", hover_color="#e74c3c"
+        )
+        self._update_status("recording inputs — press F8 to stop")
+
+    def _stop_input_recording(self):
+        self._input_recording = False
+        self.recorder.stop()
+        self.record_input_btn.configure(
+            text="Record Inputs (F8)", fg_color="#7b3fa0", hover_color="#9b52c4"
+        )
+        self._update_status("Stopped")
+
+    def _on_recorded_action(self, action: dict):
+        # Called from pynput thread — schedule on UI thread
+        self.after(0, self._append_recorded_action, action)
+
+    def _append_recorded_action(self, action: dict):
+        # Stop recording if F8 was pressed
+        key = action.get("key", "")
+        if action.get("type") == "key" and key.upper() == "F8":
+            self._stop_input_recording()
+            return
+        self.actions.append(action)
+        self._refresh_action_list()
+
     def _on_infinite_toggle(self):
         self.repeat_entry.configure(
             state="disabled" if self.infinite_var.get() else "normal"
@@ -975,6 +1130,7 @@ class AutoMacroApp(ctk.CTk):
     def _on_close(self):
         self.engine.stop()
         self.hotkey_mgr.stop()
+        self.recorder.stop()
         if hasattr(self, "_overlay"):
             self._overlay.destroy()
         self.destroy()

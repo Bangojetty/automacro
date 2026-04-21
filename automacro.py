@@ -7,6 +7,7 @@ import ctypes
 import ctypes.wintypes as wintypes
 import json
 import os
+import queue
 import sys
 import threading
 import time
@@ -91,13 +92,9 @@ class INPUT(ctypes.Structure):
 # ─── Virtual Key Code Map ────────────────────────────────────────────────────
 
 VK_MAP = {
-    # Letters
     **{chr(c): c for c in range(ord("A"), ord("Z") + 1)},
-    # Digits
     **{str(i): 0x30 + i for i in range(10)},
-    # Function keys
     **{f"F{i}": 0x6F + i for i in range(1, 13)},
-    # Special keys
     "SPACE": 0x20, "ENTER": 0x0D, "TAB": 0x09, "ESCAPE": 0x1B, "ESC": 0x1B,
     "BACKSPACE": 0x08, "DELETE": 0x2E, "INSERT": 0x2D,
     "HOME": 0x24, "END": 0x23, "PAGEUP": 0x21, "PAGEDOWN": 0x22,
@@ -106,26 +103,21 @@ VK_MAP = {
     "CTRL": 0x11, "LCTRL": 0xA2, "RCTRL": 0xA3,
     "ALT": 0x12, "LALT": 0xA4, "RALT": 0xA5,
     "CAPSLOCK": 0x14, "NUMLOCK": 0x90, "SCROLLLOCK": 0x91,
-    # Numpad
     **{f"NUM{i}": 0x60 + i for i in range(10)},
     "MULTIPLY": 0x6A, "ADD": 0x6B, "SUBTRACT": 0x6D,
     "DECIMAL": 0x6E, "DIVIDE": 0x6F,
-    # Punctuation
     "SEMICOLON": 0xBA, "EQUALS": 0xBB, "COMMA": 0xBC,
     "MINUS": 0xBD, "PERIOD": 0xBE, "SLASH": 0xBF,
     "BACKTICK": 0xC0, "LBRACKET": 0xDB, "BACKSLASH": 0xDC,
     "RBRACKET": 0xDD, "QUOTE": 0xDE,
 }
 
-# Build reverse map for display
 VK_REVERSE = {v: k for k, v in VK_MAP.items()}
 
-# Friendly names for all available keys — grouped by type, alphabetical within each group
 _LETTERS = sorted(k for k in VK_MAP if len(k) == 1 and k.isalpha())
 _DIGITS = sorted(k for k in VK_MAP if len(k) == 1 and k.isdigit())
 _FKEYS = [f"F{i}" for i in range(1, 13)]
-_MODIFIERS = sorted({"SHIFT", "LSHIFT", "RSHIFT", "CTRL", "LCTRL", "RCTRL",
-                      "ALT", "LALT", "RALT"})
+_MODIFIERS = sorted({"SHIFT", "LSHIFT", "RSHIFT", "CTRL", "LCTRL", "RCTRL", "ALT", "LALT", "RALT"})
 _NAVIGATION = sorted({"UP", "DOWN", "LEFT", "RIGHT", "HOME", "END",
                        "PAGEUP", "PAGEDOWN", "INSERT", "DELETE"})
 _NUMPAD = [f"NUM{i}" for i in range(10)] + sorted(
@@ -134,7 +126,6 @@ _OTHER = sorted(set(VK_MAP.keys()) - set(_LETTERS) - set(_DIGITS) - set(_FKEYS)
                 - set(_MODIFIERS) - set(_NAVIGATION) - set(_NUMPAD))
 ALL_KEY_NAMES = _LETTERS + _DIGITS + _FKEYS + _MODIFIERS + _NAVIGATION + _NUMPAD + _OTHER
 
-# Hotkey-compatible key names (subset used for global hotkey config)
 HOTKEY_KEYS = [f"F{i}" for i in range(1, 13)] + [
     "HOME", "END", "INSERT", "DELETE", "PAGEUP", "PAGEDOWN",
     "NUMLOCK", "SCROLLLOCK", "PAUSE",
@@ -184,7 +175,6 @@ class InputSimulator:
 
     @staticmethod
     def send_string(text: str):
-        """Type a string by sending Unicode key events for each character."""
         for char in text:
             code = ord(char)
             down = INPUT()
@@ -210,14 +200,11 @@ class InputSimulator:
         abs_y = int(y * 65535 / screen_h)
 
         if button == "right":
-            down_flag = MOUSEEVENTF_RIGHTDOWN
-            up_flag = MOUSEEVENTF_RIGHTUP
+            down_flag, up_flag = MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP
         elif button == "middle":
-            down_flag = MOUSEEVENTF_MIDDLEDOWN
-            up_flag = MOUSEEVENTF_MIDDLEUP
+            down_flag, up_flag = MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP
         else:
-            down_flag = MOUSEEVENTF_LEFTDOWN
-            up_flag = MOUSEEVENTF_LEFTUP
+            down_flag, up_flag = MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP
 
         move = INPUT()
         move.type = INPUT_MOUSE
@@ -378,10 +365,9 @@ class MacroEngine:
             while not self._stop_event.is_set():
                 iteration += 1
                 if self._on_status:
-                    if repeat == 0:
-                        self._on_status(f"running (loop {iteration}, infinite)")
-                    else:
-                        self._on_status(f"running (loop {iteration}/{repeat})")
+                    label = "infinite" if repeat == 0 else f"{iteration}/{repeat}"
+                    self._on_status(f"running (loop {iteration}, {label})" if repeat == 0
+                                    else f"running (loop {label})")
 
                 for action in actions:
                     if self._stop_event.is_set():
@@ -433,7 +419,7 @@ class MacroEngine:
 # ─── GlobalHotkeyManager ────────────────────────────────────────────────────
 
 class GlobalHotkeyManager:
-    """Use Windows RegisterHotKey API for a true OS-level global hotkey."""
+    """Single OS-level global hotkey via RegisterHotKey."""
 
     HOTKEY_ID = 1
 
@@ -460,7 +446,7 @@ class GlobalHotkeyManager:
             if self._thread and self._thread.is_alive():
                 tid = getattr(self, "_thread_id", None)
                 if tid:
-                    ctypes.windll.user32.PostThreadMessageW(tid, 0x0012, 0, 0)
+                    user32.PostThreadMessageW(tid, 0x0012, 0, 0)
             self._thread = None
 
     def _hotkey_thread(self):
@@ -479,6 +465,89 @@ class GlobalHotkeyManager:
             user32.UnregisterHotKey(None, self.HOTKEY_ID)
 
 
+# ─── MultiHotkeyManager ──────────────────────────────────────────────────────
+
+class MultiHotkeyManager:
+    """Manage N independent global hotkeys in a single message-loop thread."""
+
+    _BASE_ID = 100  # avoid conflict with GlobalHotkeyManager's ID=1
+
+    def __init__(self):
+        self._callbacks: dict[int, callable] = {}
+        self._next_id = self._BASE_ID
+        self._cmd_q: queue.Queue = queue.Queue()
+        self._thread_id: int | None = None
+        self._running = True
+        self._ready = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        self._ready.wait(timeout=2.0)
+
+    def register(self, hotkey: str, callback) -> int:
+        """Register a hotkey and return its ID (-1 on failure)."""
+        vk = vk_for_key(hotkey)
+        if vk is None:
+            return -1
+        hid = self._next_id
+        self._next_id += 1
+        self._callbacks[hid] = callback
+        self._cmd_q.put(("reg", hid, vk))
+        self._wake()
+        return hid
+
+    def unregister(self, hid: int):
+        self._callbacks.pop(hid, None)
+        self._cmd_q.put(("unreg", hid))
+        self._wake()
+
+    def unregister_all(self):
+        for hid in list(self._callbacks.keys()):
+            self.unregister(hid)
+
+    def stop(self):
+        self._running = False
+        self._wake()
+
+    def _wake(self):
+        if self._thread_id:
+            user32.PostThreadMessageW(self._thread_id, 0x0400, 0, 0)  # WM_USER
+
+    def _drain(self, registered: dict):
+        while True:
+            try:
+                cmd = self._cmd_q.get_nowait()
+            except queue.Empty:
+                break
+            if cmd[0] == "reg":
+                _, hid, vk = cmd
+                user32.RegisterHotKey(None, hid, 0, vk)
+                registered[hid] = vk
+            elif cmd[0] == "unreg":
+                _, hid = cmd
+                user32.UnregisterHotKey(None, hid)
+                registered.pop(hid, None)
+
+    def _loop(self):
+        self._thread_id = kernel32.GetCurrentThreadId()
+        self._ready.set()
+        registered: dict[int, int] = {}
+        try:
+            msg = wintypes.MSG()
+            while self._running:
+                self._drain(registered)
+                ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                if ret <= 0:
+                    break
+                if msg.message == 0x0312:  # WM_HOTKEY
+                    hid = msg.wParam
+                    cb = self._callbacks.get(hid)
+                    if cb:
+                        threading.Thread(target=cb, daemon=True).start()
+        finally:
+            for hid in list(registered.keys()):
+                user32.UnregisterHotKey(None, hid)
+
+
 # ─── UI ──────────────────────────────────────────────────────────────────────
 
 class AutoMacroApp(ctk.CTk):
@@ -487,8 +556,8 @@ class AutoMacroApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("AutoMacro")
-        self.geometry("800x720")
-        self.minsize(700, 550)
+        self.geometry("820x720")
+        self.minsize(720, 550)
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
@@ -500,10 +569,14 @@ class AutoMacroApp(ctk.CTk):
 
         self._recording_hotkey = False
         self._input_recording = False
+        self._recording_action_hotkey: int | None = None  # index being recorded
+
         self.engine = MacroEngine(on_status=self._on_engine_status,
                                    on_action=self._on_engine_action)
         self.hotkey_mgr = GlobalHotkeyManager(self.hotkey, self._toggle_macro)
         self.recorder = InputRecorder(on_action=self._on_recorded_action, stop_key="F8")
+        self.action_hotkey_mgr = MultiHotkeyManager()
+        self._action_hids: list[int] = []  # registered hotkey IDs, parallel to self.actions
 
         self._build_ui()
         self._create_overlay()
@@ -517,7 +590,6 @@ class AutoMacroApp(ctk.CTk):
         outer = ctk.CTkFrame(self, fg_color="transparent")
         outer.pack(fill="both", expand=True)
 
-        # Sidebar
         sidebar = ctk.CTkFrame(outer, width=150, corner_radius=0)
         sidebar.pack(side="left", fill="y")
         sidebar.pack_propagate(False)
@@ -537,7 +609,6 @@ class AutoMacroApp(ctk.CTk):
             btn.pack(pady=3, padx=10)
             self._tab_buttons[name] = btn
 
-        # Content area
         content = ctk.CTkFrame(outer, fg_color="transparent")
         content.pack(side="left", fill="both", expand=True, padx=10, pady=10)
 
@@ -565,23 +636,19 @@ class AutoMacroApp(ctk.CTk):
             self._refresh_presets()
 
     def _build_macro_tab(self, parent):
-        # Macro name row
         name_row = ctk.CTkFrame(parent, fg_color="transparent")
         name_row.pack(fill="x", padx=10, pady=(10, 4))
         ctk.CTkLabel(name_row, text="Name:", width=50).pack(side="left")
         self.name_var = ctk.StringVar(value=self.macro_name)
         ctk.CTkEntry(name_row, textvariable=self.name_var, width=220).pack(side="left", padx=6)
 
-        # Action list header
         ctk.CTkLabel(parent, text="Actions", font=("", 15, "bold"), anchor="w").pack(
             fill="x", padx=10, pady=(4, 2)
         )
 
-        # Scrollable action list
         self.action_frame = ctk.CTkScrollableFrame(parent, height=280)
         self.action_frame.pack(fill="both", expand=True, padx=10, pady=(0, 8))
 
-        # Add action buttons — row 1
         btn_row1 = ctk.CTkFrame(parent, fg_color="transparent")
         btn_row1.pack(fill="x", padx=10, pady=(0, 4))
         ctk.CTkButton(btn_row1, text="Add Key", width=105,
@@ -593,7 +660,6 @@ class AutoMacroApp(ctk.CTk):
         ctk.CTkButton(btn_row1, text="Add Text", width=100,
                        command=self._dlg_add_string).pack(side="left", padx=(0, 4))
 
-        # Add action buttons — row 2
         btn_row2 = ctk.CTkFrame(parent, fg_color="transparent")
         btn_row2.pack(fill="x", padx=10, pady=(0, 8))
         self.record_input_btn = ctk.CTkButton(
@@ -606,7 +672,6 @@ class AutoMacroApp(ctk.CTk):
                        fg_color="#aa3333", hover_color="#cc4444",
                        command=self._clear_actions).pack(side="left")
 
-        # Controls: Repeat + Hotkey
         ctrl1 = ctk.CTkFrame(parent)
         ctrl1.pack(fill="x", padx=10, pady=(0, 6))
 
@@ -628,7 +693,6 @@ class AutoMacroApp(ctk.CTk):
         )
         self.record_hotkey_btn.pack(side="left", padx=(0, 10))
 
-        # Start/Stop button
         ctrl2 = ctk.CTkFrame(parent, fg_color="transparent")
         ctrl2.pack(fill="x", padx=10, pady=(0, 6))
         self.start_btn = ctk.CTkButton(
@@ -638,7 +702,6 @@ class AutoMacroApp(ctk.CTk):
         )
         self.start_btn.pack(fill="x")
 
-        # Status bar
         self.status_label = ctk.CTkLabel(parent, text="Stopped", anchor="w", font=("", 12))
         self.status_label.pack(fill="x", padx=10)
 
@@ -657,13 +720,11 @@ class AutoMacroApp(ctk.CTk):
     def _refresh_presets(self):
         for w in self.preset_frame.winfo_children():
             w.destroy()
-
         files = sorted(self.PRESETS_DIR.glob("*.json"))
         if not files:
             ctk.CTkLabel(self.preset_frame, text="No presets saved yet.",
                           text_color="gray").pack(pady=20)
             return
-
         for path in files:
             row = ctk.CTkFrame(self.preset_frame)
             row.pack(fill="x", pady=3, padx=2)
@@ -672,13 +733,11 @@ class AutoMacroApp(ctk.CTk):
             )
             ctk.CTkButton(row, text="Load", width=70,
                            command=lambda p=path: self._load_preset_file(p)).pack(
-                side="left", padx=4
-            )
+                side="left", padx=4)
             ctk.CTkButton(row, text="\u2715", width=32, height=28,
                            fg_color="#aa3333", hover_color="#cc4444",
                            command=lambda p=path: self._delete_preset(p)).pack(
-                side="left", padx=(0, 6)
-            )
+                side="left", padx=(0, 6))
 
     def _save_preset(self):
         name = self.name_var.get().strip() or "Untitled"
@@ -727,6 +786,8 @@ class AutoMacroApp(ctk.CTk):
         for w in self.action_frame.winfo_children():
             w.destroy()
 
+        self._rebuild_action_hotkeys()
+
         if not self.actions:
             ctk.CTkLabel(self.action_frame, text="No actions yet. Add some above.",
                           text_color="gray").pack(pady=20)
@@ -741,32 +802,53 @@ class AutoMacroApp(ctk.CTk):
                 for child in widget.winfo_children():
                     bind_dblclick(child, idx)
 
-            ctk.CTkLabel(row, text=f"#{i+1}", width=35, font=("", 12, "bold")).pack(
-                side="left", padx=(5, 5)
+            # Index
+            ctk.CTkLabel(row, text=f"#{i+1}", width=30, font=("", 12, "bold")).pack(
+                side="left", padx=(5, 3)
             )
 
+            # Description
             desc = self._describe_action(action)
             ctk.CTkLabel(row, text=desc, anchor="w").pack(side="left", fill="x", expand=True)
 
+            # Delay badge
             delay = action.get("delay", 0)
-            ctk.CTkLabel(row, text=f"{delay}ms", width=60, text_color="gray").pack(
-                side="left", padx=5
+            ctk.CTkLabel(row, text=f"{delay}ms", width=55, text_color="gray").pack(
+                side="left", padx=3
             )
 
             bind_dblclick(row)
 
+            # Trigger (run this action once)
+            ctk.CTkButton(
+                row, text="\u25b6", width=28, height=28,
+                fg_color="#2d6a8a", hover_color="#3a85ad",
+                command=lambda a=action: self._run_single_action(a),
+            ).pack(side="left", padx=1)
+
+            # Per-action hotkey button
+            hk = action.get("hotkey", "")
+            hk_label = hk if hk else "+"
+            hk_color = "#2d5a2d" if hk else "#3a3a3a"
+            hk_hover = "#3a7a3a" if hk else "#4a4a4a"
+            ctk.CTkButton(
+                row, text=hk_label, width=46, height=28,
+                fg_color=hk_color, hover_color=hk_hover,
+                font=("", 11),
+                command=lambda idx=i: self._record_action_hotkey(idx),
+            ).pack(side="left", padx=1)
+
+            # Move up/down/delete
             if i > 0:
                 ctk.CTkButton(
                     row, text="\u25b2", width=28, height=28,
                     command=lambda idx=i: self._move_action(idx, -1),
                 ).pack(side="left", padx=1)
-
             if i < len(self.actions) - 1:
                 ctk.CTkButton(
                     row, text="\u25bc", width=28, height=28,
                     command=lambda idx=i: self._move_action(idx, 1),
                 ).pack(side="left", padx=1)
-
             ctk.CTkButton(
                 row, text="\u2715", width=28, height=28,
                 fg_color="#aa3333", hover_color="#cc4444",
@@ -784,7 +866,7 @@ class AutoMacroApp(ctk.CTk):
             return f"Delay: {action.get('delay', 0)} ms"
         elif atype == "type_string":
             text = action.get("text", "")
-            preview = text[:30] + ("..." if len(text) > 30 else "")
+            preview = text[:28] + ("..." if len(text) > 28 else "")
             return f'Text: "{preview}"'
         return "Unknown"
 
@@ -803,6 +885,87 @@ class AutoMacroApp(ctk.CTk):
     def _clear_actions(self):
         self.actions.clear()
         self._refresh_action_list()
+
+    # ── Single-action trigger ────────────────────────────────────────────
+
+    def _run_single_action(self, action: dict):
+        tmp = MacroEngine()
+        tmp.start([action], 1)
+
+    # ── Per-action hotkeys ───────────────────────────────────────────────
+
+    def _rebuild_action_hotkeys(self):
+        """Unregister all per-action hotkeys then re-register from current actions list."""
+        self.action_hotkey_mgr.unregister_all()
+        self._action_hids = []
+        for action in self.actions:
+            hk = action.get("hotkey", "")
+            if hk:
+                hid = self.action_hotkey_mgr.register(
+                    hk, lambda a=action: self._run_single_action(a)
+                )
+                self._action_hids.append(hid)
+            else:
+                self._action_hids.append(-1)
+
+    def _record_action_hotkey(self, index: int):
+        """Open a small dialog to record or clear a hotkey for the given action."""
+        action = self.actions[index]
+        current = action.get("hotkey", "")
+
+        dlg = ctk.CTkToplevel(self)
+        dlg.title("Action Hotkey")
+        dlg.geometry("280x160")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        ctk.CTkLabel(dlg, text="Press a key to assign, or clear:", font=("", 12)).pack(pady=(18, 6))
+        display_var = ctk.StringVar(value=current if current else "— none —")
+        display_lbl = ctk.CTkLabel(dlg, textvariable=display_var, font=("", 14, "bold"))
+        display_lbl.pack(pady=4)
+
+        captured = {"key": current}
+
+        def start_capture():
+            display_var.set("Press any key...")
+            capture_btn.configure(state="disabled")
+
+            def poll():
+                time.sleep(0.15)
+                for name, vk in VK_MAP.items():
+                    if user32.GetAsyncKeyState(vk) & 0x8000:
+                        captured["key"] = name
+                        dlg.after(0, lambda n=name: display_var.set(n))
+                        dlg.after(0, lambda: capture_btn.configure(state="normal"))
+                        return
+                    time.sleep(0)
+                # keep polling
+                threading.Thread(target=poll, daemon=True).start()
+
+            threading.Thread(target=poll, daemon=True).start()
+
+        btn_row = ctk.CTkFrame(dlg, fg_color="transparent")
+        btn_row.pack(pady=10)
+
+        capture_btn = ctk.CTkButton(btn_row, text="Record Key", width=110,
+                                     command=start_capture)
+        capture_btn.pack(side="left", padx=4)
+
+        def save():
+            self.actions[index]["hotkey"] = captured["key"]
+            self._refresh_action_list()
+            dlg.destroy()
+
+        def clear():
+            captured["key"] = ""
+            self.actions[index].pop("hotkey", None)
+            self._refresh_action_list()
+            dlg.destroy()
+
+        ctk.CTkButton(btn_row, text="Save", width=70, command=save).pack(side="left", padx=4)
+        ctk.CTkButton(btn_row, text="Clear", width=60, fg_color="#aa3333",
+                       hover_color="#cc4444", command=clear).pack(side="left", padx=4)
 
     # ── Dialogs ──────────────────────────────────────────────────────────
 
@@ -848,12 +1011,13 @@ class AutoMacroApp(ctk.CTk):
             except ValueError:
                 delay = 100
             new_action = {
-                "type": "key",
-                "key": key_var.get(),
-                "action": action_var.get(),
-                "delay": max(0, delay),
+                "type": "key", "key": key_var.get(),
+                "action": action_var.get(), "delay": max(0, delay),
             }
             if editing:
+                new_action["hotkey"] = existing.get("hotkey", "")
+                if not new_action["hotkey"]:
+                    new_action.pop("hotkey", None)
                 self.actions[edit_index] = new_action
             else:
                 self.actions.append(new_action)
@@ -919,12 +1083,13 @@ class AutoMacroApp(ctk.CTk):
             except ValueError:
                 x, y, delay = 0, 0, 200
             new_action = {
-                "type": "click",
-                "x": x, "y": y,
-                "button": btn_var.get(),
-                "delay": max(0, delay),
+                "type": "click", "x": x, "y": y,
+                "button": btn_var.get(), "delay": max(0, delay),
             }
             if editing:
+                new_action["hotkey"] = existing.get("hotkey", "")
+                if not new_action["hotkey"]:
+                    new_action.pop("hotkey", None)
                 self.actions[edit_index] = new_action
             else:
                 self.actions.append(new_action)
@@ -955,6 +1120,9 @@ class AutoMacroApp(ctk.CTk):
                 delay = 500
             new_action = {"type": "delay", "delay": max(0, delay)}
             if editing:
+                new_action["hotkey"] = existing.get("hotkey", "")
+                if not new_action["hotkey"]:
+                    new_action.pop("hotkey", None)
                 self.actions[edit_index] = new_action
             else:
                 self.actions.append(new_action)
@@ -991,6 +1159,9 @@ class AutoMacroApp(ctk.CTk):
                 delay = 0
             new_action = {"type": "type_string", "text": text, "delay": max(0, delay)}
             if editing:
+                new_action["hotkey"] = existing.get("hotkey", "")
+                if not new_action["hotkey"]:
+                    new_action.pop("hotkey", None)
                 self.actions[edit_index] = new_action
             else:
                 self.actions.append(new_action)
@@ -1036,8 +1207,7 @@ class AutoMacroApp(ctk.CTk):
         self.after(0, self._append_recorded_action, action)
 
     def _append_recorded_action(self, action: dict):
-        key = action.get("key", "")
-        if action.get("type") == "key" and key.upper() == "F8":
+        if action.get("type") == "key" and action.get("key", "").upper() == "F8":
             self._stop_input_recording()
             return
         self.actions.append(action)
@@ -1095,8 +1265,6 @@ class AutoMacroApp(ctk.CTk):
     OV_SCALE = 4
     OV_RENDER = OV_DISPLAY * OV_SCALE
     OV_RING_WIDTH = 5
-    OV_BORDER_WIDTH = 0
-    OV_ARC_WIDTH = 4
     OV_STEPS = 24
     OV_FRAME_MS = 18
 
@@ -1134,17 +1302,15 @@ class AutoMacroApp(ctk.CTk):
         self._overlay.overrideredirect(True)
         self._overlay.attributes("-topmost", True)
         self._overlay.attributes("-transparentcolor", TRANS_COLOR)
-        self._overlay.geometry(f"{D}x{D}+810+26")
+        self._overlay.geometry(f"{D}x{D}+830+26")
         self._overlay.configure(fg_color=TRANS_COLOR)
 
         self._overlay.update_idletasks()
         hwnd = ctypes.windll.user32.GetParent(self._overlay.winfo_id())
         GWL_EXSTYLE = -20
-        WS_EX_LAYERED = 0x80000
-        WS_EX_TRANSPARENT = 0x20
         style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
         ctypes.windll.user32.SetWindowLongW(
-            hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED | WS_EX_TRANSPARENT
+            hwnd, GWL_EXSTYLE, style | 0x80000 | 0x20
         )
 
         self._ov_canvas = tk.Canvas(
@@ -1157,10 +1323,7 @@ class AutoMacroApp(ctk.CTk):
         self._ov_img_id = self._ov_canvas.create_image(D // 2, D // 2, image=self._ov_tk_img)
 
         step = 360 // self.OV_STEPS
-        self._ov_dot_frames = {}
-        for i in range(self.OV_STEPS):
-            self._ov_dot_frames[i] = self._ov_render_dot(i * step)
-
+        self._ov_dot_frames = {i: self._ov_render_dot(i * step) for i in range(self.OV_STEPS)}
         self._ov_active_dots: list[int] = []
         self._ov_ticking = False
 
@@ -1179,22 +1342,19 @@ class AutoMacroApp(ctk.CTk):
             self._ov_tick()
 
     def _ov_tick(self):
-        new_dots = []
-        for step in self._ov_active_dots:
-            step += 1
-            if step < self.OV_STEPS:
-                new_dots.append(step)
+        new_dots = [s + 1 for s in self._ov_active_dots if s + 1 < self.OV_STEPS]
         self._ov_active_dots = new_dots
 
         S = self.OV_RENDER
-        combined = self._ov_base.copy() if not new_dots else None
         if new_dots:
             composite = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-            for step in new_dots:
-                composite = Image.alpha_composite(composite, self._ov_dot_frames[step])
-            composite_small = composite.resize((self.OV_DISPLAY, self.OV_DISPLAY), Image.LANCZOS)
+            for s in new_dots:
+                composite = Image.alpha_composite(composite, self._ov_dot_frames[s])
+            small = composite.resize((self.OV_DISPLAY, self.OV_DISPLAY), Image.LANCZOS)
             combined = self._ov_base.copy()
-            combined.paste(composite_small, (0, 0), composite_small)
+            combined.paste(small, (0, 0), small)
+        else:
+            combined = self._ov_base.copy()
 
         self._ov_tk_img = ImageTk.PhotoImage(combined)
         self._ov_canvas.itemconfigure(self._ov_img_id, image=self._ov_tk_img)
@@ -1210,6 +1370,7 @@ class AutoMacroApp(ctk.CTk):
         self.engine.stop()
         self.hotkey_mgr.stop()
         self.recorder.stop()
+        self.action_hotkey_mgr.stop()
         if hasattr(self, "_overlay"):
             self._overlay.destroy()
         self.destroy()

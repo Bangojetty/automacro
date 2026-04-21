@@ -720,6 +720,7 @@ class AutoMacroApp(ctk.CTk):
 
         self._recording_hotkey = False
         self._input_recording = False
+        self._macro_locked = False
 
         self.engine = MacroEngine(on_status=self._on_engine_status,
                                    on_action=self._on_engine_action)
@@ -1304,6 +1305,34 @@ class AutoMacroApp(ctk.CTk):
 
     # ── Action Dialogs ───────────────────────────────────────────────────
 
+    def _lock_macro(self):
+        if self._macro_locked:
+            return
+        self._macro_locked = True
+        if self.engine.running:
+            self.engine.stop()
+        self.hotkey_mgr.stop()
+        self.start_btn.configure(state="disabled")
+
+    def _unlock_macro(self):
+        if not self._macro_locked:
+            return
+        self._macro_locked = False
+        if self.hotkey_enabled_var.get():
+            self.hotkey_mgr.set_hotkey(self.hotkey)
+        self.start_btn.configure(state="normal")
+
+    def _make_action_dlg(self, title: str) -> ctk.CTkToplevel:
+        """Create a standard action dialog and lock macro execution for its lifetime."""
+        self._lock_macro()
+        dlg = ctk.CTkToplevel(self)
+        dlg.title(title)
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.bind("<Destroy>", lambda e: self._unlock_macro() if e.widget is dlg else None)
+        return dlg
+
     def _dlg_add_combo(self, edit_index: int | None = None):
         editing = edit_index is not None
         existing = self._current_actions[edit_index] if editing else {}
@@ -1311,11 +1340,7 @@ class AutoMacroApp(ctk.CTk):
         ex_mods = {k.upper() for k in ex_keys if k.upper() in _MODIFIER_NAMES}
         ex_main = next((k for k in ex_keys if k.upper() not in _MODIFIER_NAMES), "A")
 
-        dlg = ctk.CTkToplevel(self)
-        dlg.title("Edit Combo" if editing else "Add Combo")
-        dlg.resizable(False, False)
-        dlg.transient(self)
-        dlg.grab_set()
+        dlg = self._make_action_dlg("Edit Combo" if editing else "Add Combo")
 
         ctk.CTkLabel(dlg, text="Modifiers:", anchor="w").pack(fill="x", padx=20, pady=(14, 4))
         mod_frame = ctk.CTkFrame(dlg, fg_color="transparent")
@@ -1395,11 +1420,7 @@ class AutoMacroApp(ctk.CTk):
         editing = edit_index is not None
         existing = self._current_actions[edit_index] if editing else {}
 
-        dlg = ctk.CTkToplevel(self)
-        dlg.title("Edit Key Press" if editing else "Add Key Press")
-        dlg.resizable(False, False)
-        dlg.transient(self)
-        dlg.grab_set()
+        dlg = self._make_action_dlg("Edit Key Press" if editing else "Add Key Press")
 
         captured = {"key": existing.get("key", "")}
 
@@ -1474,11 +1495,7 @@ class AutoMacroApp(ctk.CTk):
         editing = edit_index is not None
         existing = self._current_actions[edit_index] if editing else {}
 
-        dlg = ctk.CTkToplevel(self)
-        dlg.title("Edit Mouse Click" if editing else "Add Mouse Click")
-        dlg.resizable(False, False)
-        dlg.transient(self)
-        dlg.grab_set()
+        dlg = self._make_action_dlg("Edit Mouse Click" if editing else "Add Mouse Click")
 
         coord_frame = ctk.CTkFrame(dlg, fg_color="transparent")
         coord_frame.pack(pady=(15, 5))
@@ -1551,11 +1568,7 @@ class AutoMacroApp(ctk.CTk):
         editing = edit_index is not None
         existing = self._current_actions[edit_index] if editing else {}
 
-        dlg = ctk.CTkToplevel(self)
-        dlg.title("Edit Delay" if editing else "Add Delay")
-        dlg.resizable(False, False)
-        dlg.transient(self)
-        dlg.grab_set()
+        dlg = self._make_action_dlg("Edit Delay" if editing else "Add Delay")
 
         ctk.CTkLabel(dlg, text="Repeat:").pack(pady=(20, 0))
         repeat_var = ctk.StringVar(value=str(existing.get("repeat", 1)))
@@ -1589,11 +1602,7 @@ class AutoMacroApp(ctk.CTk):
         editing = edit_index is not None
         existing = self._current_actions[edit_index] if editing else {}
 
-        dlg = ctk.CTkToplevel(self)
-        dlg.title("Edit Text" if editing else "Add Text")
-        dlg.resizable(False, False)
-        dlg.transient(self)
-        dlg.grab_set()
+        dlg = self._make_action_dlg("Edit Text" if editing else "Add Text")
 
         ctk.CTkLabel(dlg, text="Text to type:").pack(pady=(15, 0))
         text_box = ctk.CTkTextbox(dlg, width=340, height=80)

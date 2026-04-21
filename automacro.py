@@ -189,11 +189,20 @@ class InputSimulator:
         InputSimulator.send_key_up(vk)
 
     @staticmethod
-    def send_combo(keys: list[str]):
-        """Hold modifiers, tap the main key, release — with delays so games register the hold."""
+    def send_combo(keys: list[str], debug_log=None):
+        """Hold modifiers, tap the main key, release — with delays so the target registers the hold."""
         vks = [vk_for_key(k) for k in keys]
+
+        def log(msg):
+            if debug_log:
+                debug_log(msg)
+
+        log(f"send_combo called: keys={keys}")
+        log(f"  resolved VKs (before filter): {[hex(v) if v else None for v in vks]}")
+
         vks = [v for v in vks if v is not None]
         if not vks:
+            log("  ERROR: no valid VKs resolved — aborting")
             return
 
         def ki(vk: int, flags: int) -> INPUT:
@@ -204,24 +213,32 @@ class InputSimulator:
             inp.union.ki.dwFlags = flags
             return inp
 
+        def send_and_log(vk: int, flags: int, label: str):
+            scan = user32.MapVirtualKeyW(vk, 0)
+            log(f"  {label}: vk={hex(vk)} scan={hex(scan)} flags={hex(flags)}")
+            n = len([ki(vk, flags)])
+            arr = (INPUT * 1)(ki(vk, flags))
+            result = user32.SendInput(1, ctypes.pointer(arr), ctypes.sizeof(INPUT))
+            log(f"    SendInput returned {result} (expected 1)")
+
         modifiers = vks[:-1]
         main = vks[-1]
+        log(f"  modifiers={[hex(v) for v in modifiers]}  main={hex(main)}")
 
-        # Press each modifier down individually so the game sees them held
         for vk in modifiers:
-            InputSimulator._send([ki(vk, 0)])
+            send_and_log(vk, 0, "MOD DOWN")
             time.sleep(0.02)
 
-        # Tap the main key while modifiers are held
-        InputSimulator._send([ki(main, 0)])
+        send_and_log(main, 0, "MAIN DOWN")
         time.sleep(0.02)
-        InputSimulator._send([ki(main, KEYEVENTF_KEYUP)])
+        send_and_log(main, KEYEVENTF_KEYUP, "MAIN UP")
         time.sleep(0.01)
 
-        # Release modifiers in reverse
         for vk in reversed(modifiers):
-            InputSimulator._send([ki(vk, KEYEVENTF_KEYUP)])
+            send_and_log(vk, KEYEVENTF_KEYUP, "MOD UP")
             time.sleep(0.01)
+
+        log("send_combo done")
 
     @staticmethod
     def send_string(text: str):
@@ -439,12 +456,23 @@ def _order_modifiers(mods: set[str]) -> list[str]:
 class MacroEngine:
     """Execute a list of macro actions in a background thread."""
 
+    _log_path = Path(__file__).parent / "automacro.log"
+
     def __init__(self, on_status=None, on_action=None):
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._on_status = on_status
         self._on_action = on_action
         self.running = False
+
+    def _debug_log(self, msg: str):
+        ts = time.strftime("%H:%M:%S")
+        line = f"[{ts}] {msg}\n"
+        try:
+            with open(self._log_path, "a", encoding="utf-8") as f:
+                f.write(line)
+        except Exception:
+            pass
 
     def start(self, actions: list[dict], repeat: int):
         if self.running:
@@ -508,7 +536,7 @@ class MacroEngine:
             else:
                 InputSimulator.send_key_tap(vk)
         elif atype == "combo":
-            InputSimulator.send_combo(action.get("keys", []))
+            InputSimulator.send_combo(action.get("keys", []), debug_log=self._debug_log)
         elif atype == "click":
             InputSimulator.send_mouse_click(action["x"], action["y"], action.get("button", "left"))
         elif atype == "delay":

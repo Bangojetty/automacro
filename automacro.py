@@ -701,6 +701,7 @@ class MultiHotkeyManager:
 
 class AutoMacroApp(ctk.CTk):
     PRESETS_DIR = Path(__file__).parent / "presets"
+    SESSION_FILE = Path(__file__).parent / "last_session.json"
 
     def __init__(self):
         super().__init__()
@@ -733,7 +734,7 @@ class AutoMacroApp(ctk.CTk):
 
         self._build_ui()
         self._create_overlay()
-        self._refresh_seq_list()
+        self._load_last_session()
         self._update_status("Stopped")
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(200, self._init_focus_tracking)
@@ -1895,7 +1896,34 @@ class AutoMacroApp(ctk.CTk):
 
     # ── Cleanup ──────────────────────────────────────────────────────────
 
+    def _save_last_session(self):
+        if self._editing_seq_index is not None:
+            self._save_seq_edits()
+        repeat = 0 if self.infinite_var.get() else int(self.repeat_var.get() or 1)
+        data = {
+            "name": self.name_var.get().strip() or "Untitled",
+            "hotkey": self.hotkey,
+            "hotkey_enabled": self.hotkey_enabled_var.get(),
+            "repeat": repeat,
+            "sequences": self.sequences,
+        }
+        try:
+            self.SESSION_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _load_last_session(self):
+        if self.SESSION_FILE.exists():
+            try:
+                data = json.loads(self.SESSION_FILE.read_text(encoding="utf-8"))
+                self._apply_macro_data(data)
+                return
+            except Exception:
+                pass
+        self._refresh_seq_list()
+
     def _on_close(self):
+        self._save_last_session()
         self.engine.stop()
         self.hotkey_mgr.stop()
         self.recorder.stop()

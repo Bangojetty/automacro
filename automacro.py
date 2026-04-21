@@ -998,7 +998,6 @@ class AutoMacroApp(ctk.CTk):
 
         dlg = ctk.CTkToplevel(self)
         dlg.title("Action Hotkey")
-        dlg.geometry("280x160")
         dlg.resizable(False, False)
         dlg.transient(self)
         dlg.grab_set()
@@ -1071,7 +1070,6 @@ class AutoMacroApp(ctk.CTk):
 
         dlg = ctk.CTkToplevel(self)
         dlg.title("Edit Combo" if editing else "Add Combo")
-        dlg.geometry("340x300")
         dlg.resizable(False, False)
         dlg.transient(self)
         dlg.grab_set()
@@ -1159,7 +1157,6 @@ class AutoMacroApp(ctk.CTk):
 
         dlg = ctk.CTkToplevel(self)
         dlg.title("Edit Key Press" if editing else "Add Key Press")
-        dlg.geometry("320x340")
         dlg.resizable(False, False)
         dlg.transient(self)
         dlg.grab_set()
@@ -1241,7 +1238,6 @@ class AutoMacroApp(ctk.CTk):
 
         dlg = ctk.CTkToplevel(self)
         dlg.title("Edit Mouse Click" if editing else "Add Mouse Click")
-        dlg.geometry("320x280")
         dlg.resizable(False, False)
         dlg.transient(self)
         dlg.grab_set()
@@ -1320,7 +1316,6 @@ class AutoMacroApp(ctk.CTk):
 
         dlg = ctk.CTkToplevel(self)
         dlg.title("Edit Delay" if editing else "Add Delay")
-        dlg.geometry("280x140")
         dlg.resizable(False, False)
         dlg.transient(self)
         dlg.grab_set()
@@ -1360,7 +1355,6 @@ class AutoMacroApp(ctk.CTk):
 
         dlg = ctk.CTkToplevel(self)
         dlg.title("Edit Text" if editing else "Add Text")
-        dlg.geometry("380x220")
         dlg.resizable(False, False)
         dlg.transient(self)
         dlg.grab_set()

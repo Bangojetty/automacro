@@ -966,7 +966,38 @@ class AutoMacroApp(ctk.CTk):
             side="left", padx=(5, 3))
 
         name = seq.get("name", f"Sequence {i+1}")
-        ctk.CTkLabel(row, text=name, anchor="w").pack(side="left", fill="x", expand=True)
+        name_cell = ctk.CTkFrame(row, fg_color="transparent")
+        name_cell.pack(side="left", fill="x", expand=True)
+
+        name_lbl = ctk.CTkLabel(name_cell, text=name, anchor="w")
+        name_lbl.pack(fill="x", expand=True, padx=2)
+
+        name_entry = ctk.CTkEntry(name_cell, height=28)
+
+        def _start_rename(e, s=seq, lbl=name_lbl, ent=name_entry):
+            lbl.pack_forget()
+            ent.delete(0, "end")
+            ent.insert(0, s.get("name", ""))
+            ent.pack(fill="x", expand=True, padx=2)
+            ent.focus_set()
+            ent.select_range(0, "end")
+
+        def _commit_rename(e, s=seq, lbl=name_lbl, ent=name_entry):
+            new_name = ent.get().strip()
+            if new_name:
+                s["name"] = new_name
+                lbl.configure(text=new_name)
+            ent.pack_forget()
+            lbl.pack(fill="x", expand=True, padx=2)
+
+        def _cancel_rename(e, lbl=name_lbl, ent=name_entry):
+            ent.pack_forget()
+            lbl.pack(fill="x", expand=True, padx=2)
+
+        name_lbl.bind("<Double-Button-1>", _start_rename)
+        name_entry.bind("<Return>", _commit_rename)
+        name_entry.bind("<FocusOut>", _commit_rename)
+        name_entry.bind("<Escape>", _cancel_rename)
 
         n = len(seq.get("actions", []))
         ctk.CTkLabel(row, text=f"{n} action{'s' if n != 1 else ''}",

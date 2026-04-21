@@ -741,7 +741,7 @@ class AutoMacroApp(ctk.CTk):
 
         # Default delay — top-right
         ctk.CTkLabel(name_row, text="Default delay (ms):").pack(side="right", padx=(6, 0))
-        self.default_delay_var = ctk.StringVar(value="100")
+        self.default_delay_var = ctk.StringVar(value="10")
         ctk.CTkEntry(name_row, textvariable=self.default_delay_var, width=70).pack(side="right")
 
         ctk.CTkLabel(parent, text="Actions", font=("", 15, "bold"), anchor="w").pack(
@@ -989,7 +989,7 @@ class AutoMacroApp(ctk.CTk):
         try:
             return max(0, int(self.default_delay_var.get()))
         except (ValueError, AttributeError):
-            return 100
+            return 10
 
     # ── Single-action trigger ────────────────────────────────────────────
 

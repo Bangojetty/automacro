@@ -126,14 +126,29 @@ _OTHER = sorted(set(VK_MAP.keys()) - set(_LETTERS) - set(_DIGITS) - set(_FKEYS)
                 - set(_MODIFIERS) - set(_NAVIGATION) - set(_NUMPAD))
 ALL_KEY_NAMES = _LETTERS + _DIGITS + _FKEYS + _MODIFIERS + _NAVIGATION + _NUMPAD + _OTHER
 
-HOTKEY_KEYS = [f"F{i}" for i in range(1, 13)] + [
-    "HOME", "END", "INSERT", "DELETE", "PAGEUP", "PAGEDOWN",
-    "NUMLOCK", "SCROLLLOCK", "PAUSE",
-]
+# Modifier key names used for combo detection
+_MODIFIER_NAMES = frozenset({"CTRL", "LCTRL", "RCTRL", "SHIFT", "LSHIFT", "RSHIFT",
+                              "ALT", "LALT", "RALT"})
 
 
 def vk_for_key(name: str) -> int | None:
     return VK_MAP.get(name.upper())
+
+
+def combo_display(keys: list[str]) -> str:
+    """Human-readable combo string, e.g. ['LCTRL', 'C'] → 'Ctrl+C'."""
+    parts = []
+    for k in keys:
+        ku = k.upper()
+        if ku in ("CTRL", "LCTRL", "RCTRL"):
+            parts.append("Ctrl")
+        elif ku in ("SHIFT", "LSHIFT", "RSHIFT"):
+            parts.append("Shift")
+        elif ku in ("ALT", "LALT", "RALT"):
+            parts.append("Alt")
+        else:
+            parts.append(ku)
+    return "+".join(parts)
 
 
 # ─── InputSimulator ──────────────────────────────────────────────────────────
@@ -172,6 +187,22 @@ class InputSimulator:
         InputSimulator.send_key_down(vk)
         time.sleep(0.01)
         InputSimulator.send_key_up(vk)
+
+    @staticmethod
+    def send_combo(keys: list[str]):
+        """Press modifier keys, tap the final key, release modifiers."""
+        vks = [vk_for_key(k) for k in keys]
+        vks = [v for v in vks if v is not None]
+        if not vks:
+            return
+        # Hold all but the last, tap the last, then release in reverse
+        for vk in vks[:-1]:
+            InputSimulator.send_key_down(vk)
+            time.sleep(0.005)
+        InputSimulator.send_key_tap(vks[-1])
+        for vk in reversed(vks[:-1]):
+            InputSimulator.send_key_up(vk)
+            time.sleep(0.005)
 
     @staticmethod
     def send_string(text: str):
@@ -230,7 +261,12 @@ class InputSimulator:
 # ─── InputRecorder ───────────────────────────────────────────────────────────
 
 class InputRecorder:
-    """Capture live keyboard and mouse events and build an action list."""
+    """Capture live keyboard and mouse events and build an action list.
+
+    Multi-key combos: when a modifier (Ctrl/Shift/Alt) is held while a
+    non-modifier key is pressed, they are grouped into a single combo action
+    instead of being recorded as separate key presses.
+    """
 
     _PYNPUT_KEY_MAP = {
         pynput_kb.Key.space: "SPACE",
@@ -270,17 +306,29 @@ class InputRecorder:
         self._mouse_listener = None
         self._last_time = None
         self.recording = False
+        self._held_modifiers: set[str] = set()   # modifiers currently down
+        self._used_in_combo: set[str] = set()    # modifiers already consumed by a combo
 
     def start(self):
         self.recording = True
         self._last_time = time.monotonic()
-        self._kb_listener = pynput_kb.Listener(on_press=self._on_key_press, suppress=False)
-        self._mouse_listener = pynput_mouse.Listener(on_click=self._on_mouse_click, suppress=False)
+        self._held_modifiers.clear()
+        self._used_in_combo.clear()
+        self._kb_listener = pynput_kb.Listener(
+            on_press=self._on_key_press,
+            on_release=self._on_key_release,
+            suppress=False,
+        )
+        self._mouse_listener = pynput_mouse.Listener(
+            on_click=self._on_mouse_click, suppress=False
+        )
         self._kb_listener.start()
         self._mouse_listener.start()
 
     def stop(self):
         self.recording = False
+        self._held_modifiers.clear()
+        self._used_in_combo.clear()
         if self._kb_listener:
             self._kb_listener.stop()
             self._kb_listener = None
@@ -304,10 +352,40 @@ class InputRecorder:
         name = self._resolve_key(key)
         if name is None:
             return
-        delay = self._elapsed_ms()
-        if name.upper() == self._stop_key:
+        name_upper = name.upper()
+
+        if name_upper == self._stop_key:
             return
-        self._emit({"type": "key", "key": name, "action": "tap", "delay": delay})
+
+        if name_upper in _MODIFIER_NAMES:
+            # Track but don't emit yet — wait to see if used in a combo
+            self._held_modifiers.add(name_upper)
+        else:
+            delay = self._elapsed_ms()
+            if self._held_modifiers:
+                # Group held modifiers + this key into a combo
+                # Order: Ctrl, Shift, Alt, then the main key
+                ordered_mods = _order_modifiers(self._held_modifiers)
+                keys = ordered_mods + [name_upper]
+                self._emit({"type": "combo", "keys": keys, "delay": delay})
+                self._used_in_combo.update(self._held_modifiers)
+            else:
+                self._emit({"type": "key", "key": name_upper, "action": "tap", "delay": delay})
+
+    def _on_key_release(self, key):
+        if not self.recording:
+            return
+        name = self._resolve_key(key)
+        if name is None:
+            return
+        name_upper = name.upper()
+        if name_upper in _MODIFIER_NAMES:
+            if name_upper not in self._used_in_combo:
+                # Standalone modifier press (not part of any combo) — emit it now
+                delay = self._elapsed_ms()
+                self._emit({"type": "key", "key": name_upper, "action": "tap", "delay": delay})
+            self._held_modifiers.discard(name_upper)
+            self._used_in_combo.discard(name_upper)
 
     def _on_mouse_click(self, x, y, button, pressed):
         if not self.recording or not pressed:
@@ -329,6 +407,12 @@ class InputRecorder:
         except AttributeError:
             pass
         return None
+
+
+def _order_modifiers(mods: set[str]) -> list[str]:
+    """Return modifiers in a canonical order: Ctrl, Shift, Alt."""
+    order = ["CTRL", "LCTRL", "RCTRL", "SHIFT", "LSHIFT", "RSHIFT", "ALT", "LALT", "RALT"]
+    return [m for m in order if m in mods]
 
 
 # ─── MacroEngine ─────────────────────────────────────────────────────────────
@@ -365,9 +449,10 @@ class MacroEngine:
             while not self._stop_event.is_set():
                 iteration += 1
                 if self._on_status:
-                    label = "infinite" if repeat == 0 else f"{iteration}/{repeat}"
-                    self._on_status(f"running (loop {iteration}, {label})" if repeat == 0
-                                    else f"running (loop {label})")
+                    if repeat == 0:
+                        self._on_status(f"running (loop {iteration}, infinite)")
+                    else:
+                        self._on_status(f"running (loop {iteration}/{repeat})")
 
                 for action in actions:
                     if self._stop_event.is_set():
@@ -399,6 +484,8 @@ class MacroEngine:
                 InputSimulator.send_key_up(vk)
             else:
                 InputSimulator.send_key_tap(vk)
+        elif atype == "combo":
+            InputSimulator.send_combo(action.get("keys", []))
         elif atype == "click":
             InputSimulator.send_mouse_click(action["x"], action["y"], action.get("button", "left"))
         elif atype == "delay":
@@ -470,7 +557,7 @@ class GlobalHotkeyManager:
 class MultiHotkeyManager:
     """Manage N independent global hotkeys in a single message-loop thread."""
 
-    _BASE_ID = 100  # avoid conflict with GlobalHotkeyManager's ID=1
+    _BASE_ID = 100
 
     def __init__(self):
         self._callbacks: dict[int, callable] = {}
@@ -484,7 +571,6 @@ class MultiHotkeyManager:
         self._ready.wait(timeout=2.0)
 
     def register(self, hotkey: str, callback) -> int:
-        """Register a hotkey and return its ID (-1 on failure)."""
         vk = vk_for_key(hotkey)
         if vk is None:
             return -1
@@ -510,7 +596,7 @@ class MultiHotkeyManager:
 
     def _wake(self):
         if self._thread_id:
-            user32.PostThreadMessageW(self._thread_id, 0x0400, 0, 0)  # WM_USER
+            user32.PostThreadMessageW(self._thread_id, 0x0400, 0, 0)
 
     def _drain(self, registered: dict):
         while True:
@@ -538,7 +624,7 @@ class MultiHotkeyManager:
                 ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
                 if ret <= 0:
                     break
-                if msg.message == 0x0312:  # WM_HOTKEY
+                if msg.message == 0x0312:
                     hid = msg.wParam
                     cb = self._callbacks.get(hid)
                     if cb:
@@ -569,14 +655,13 @@ class AutoMacroApp(ctk.CTk):
 
         self._recording_hotkey = False
         self._input_recording = False
-        self._recording_action_hotkey: int | None = None  # index being recorded
 
         self.engine = MacroEngine(on_status=self._on_engine_status,
                                    on_action=self._on_engine_action)
         self.hotkey_mgr = GlobalHotkeyManager(self.hotkey, self._toggle_macro)
         self.recorder = InputRecorder(on_action=self._on_recorded_action, stop_key="F8")
         self.action_hotkey_mgr = MultiHotkeyManager()
-        self._action_hids: list[int] = []  # registered hotkey IDs, parallel to self.actions
+        self._action_hids: list[int] = []
 
         self._build_ui()
         self._create_overlay()
@@ -646,20 +731,24 @@ class AutoMacroApp(ctk.CTk):
             fill="x", padx=10, pady=(4, 2)
         )
 
-        self.action_frame = ctk.CTkScrollableFrame(parent, height=280)
+        self.action_frame = ctk.CTkScrollableFrame(parent, height=260)
         self.action_frame.pack(fill="both", expand=True, padx=10, pady=(0, 8))
 
+        # Add buttons — row 1
         btn_row1 = ctk.CTkFrame(parent, fg_color="transparent")
         btn_row1.pack(fill="x", padx=10, pady=(0, 4))
-        ctk.CTkButton(btn_row1, text="Add Key", width=105,
+        ctk.CTkButton(btn_row1, text="Add Key", width=95,
                        command=self._dlg_add_key).pack(side="left", padx=(0, 4))
-        ctk.CTkButton(btn_row1, text="Add Click", width=105,
+        ctk.CTkButton(btn_row1, text="Add Combo", width=100,
+                       command=self._dlg_add_combo).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(btn_row1, text="Add Click", width=95,
                        command=self._dlg_add_click).pack(side="left", padx=(0, 4))
-        ctk.CTkButton(btn_row1, text="Add Delay", width=100,
+        ctk.CTkButton(btn_row1, text="Add Delay", width=95,
                        command=self._dlg_add_delay).pack(side="left", padx=(0, 4))
-        ctk.CTkButton(btn_row1, text="Add Text", width=100,
+        ctk.CTkButton(btn_row1, text="Add Text", width=90,
                        command=self._dlg_add_string).pack(side="left", padx=(0, 4))
 
+        # Add buttons — row 2
         btn_row2 = ctk.CTkFrame(parent, fg_color="transparent")
         btn_row2.pack(fill="x", padx=10, pady=(0, 8))
         self.record_input_btn = ctk.CTkButton(
@@ -729,8 +818,7 @@ class AutoMacroApp(ctk.CTk):
             row = ctk.CTkFrame(self.preset_frame)
             row.pack(fill="x", pady=3, padx=2)
             ctk.CTkLabel(row, text=path.stem, anchor="w", font=("", 13)).pack(
-                side="left", fill="x", expand=True, padx=10
-            )
+                side="left", fill="x", expand=True, padx=10)
             ctk.CTkButton(row, text="Load", width=70,
                            command=lambda p=path: self._load_preset_file(p)).pack(
                 side="left", padx=4)
@@ -802,43 +890,33 @@ class AutoMacroApp(ctk.CTk):
                 for child in widget.winfo_children():
                     bind_dblclick(child, idx)
 
-            # Index
             ctk.CTkLabel(row, text=f"#{i+1}", width=30, font=("", 12, "bold")).pack(
-                side="left", padx=(5, 3)
-            )
+                side="left", padx=(5, 3))
 
-            # Description
             desc = self._describe_action(action)
             ctk.CTkLabel(row, text=desc, anchor="w").pack(side="left", fill="x", expand=True)
 
-            # Delay badge
             delay = action.get("delay", 0)
             ctk.CTkLabel(row, text=f"{delay}ms", width=55, text_color="gray").pack(
-                side="left", padx=3
-            )
+                side="left", padx=3)
 
             bind_dblclick(row)
 
-            # Trigger (run this action once)
             ctk.CTkButton(
                 row, text="\u25b6", width=28, height=28,
                 fg_color="#2d6a8a", hover_color="#3a85ad",
                 command=lambda a=action: self._run_single_action(a),
             ).pack(side="left", padx=1)
 
-            # Per-action hotkey button
             hk = action.get("hotkey", "")
-            hk_label = hk if hk else "+"
-            hk_color = "#2d5a2d" if hk else "#3a3a3a"
-            hk_hover = "#3a7a3a" if hk else "#4a4a4a"
             ctk.CTkButton(
-                row, text=hk_label, width=46, height=28,
-                fg_color=hk_color, hover_color=hk_hover,
+                row, text=hk if hk else "+", width=46, height=28,
+                fg_color="#2d5a2d" if hk else "#3a3a3a",
+                hover_color="#3a7a3a" if hk else "#4a4a4a",
                 font=("", 11),
                 command=lambda idx=i: self._record_action_hotkey(idx),
             ).pack(side="left", padx=1)
 
-            # Move up/down/delete
             if i > 0:
                 ctk.CTkButton(
                     row, text="\u25b2", width=28, height=28,
@@ -860,6 +938,8 @@ class AutoMacroApp(ctk.CTk):
         atype = action.get("type")
         if atype == "key":
             return f"Key: {action['key'].upper()}  ({action.get('action', 'tap')})"
+        elif atype == "combo":
+            return f"Combo: {combo_display(action.get('keys', []))}"
         elif atype == "click":
             return f"Click: ({action['x']}, {action['y']})  {action.get('button', 'left')}"
         elif atype == "delay":
@@ -889,13 +969,11 @@ class AutoMacroApp(ctk.CTk):
     # ── Single-action trigger ────────────────────────────────────────────
 
     def _run_single_action(self, action: dict):
-        tmp = MacroEngine()
-        tmp.start([action], 1)
+        MacroEngine().start([action], 1)
 
     # ── Per-action hotkeys ───────────────────────────────────────────────
 
     def _rebuild_action_hotkeys(self):
-        """Unregister all per-action hotkeys then re-register from current actions list."""
         self.action_hotkey_mgr.unregister_all()
         self._action_hids = []
         for action in self.actions:
@@ -909,7 +987,6 @@ class AutoMacroApp(ctk.CTk):
                 self._action_hids.append(-1)
 
     def _record_action_hotkey(self, index: int):
-        """Open a small dialog to record or clear a hotkey for the given action."""
         action = self.actions[index]
         current = action.get("hotkey", "")
 
@@ -922,8 +999,7 @@ class AutoMacroApp(ctk.CTk):
 
         ctk.CTkLabel(dlg, text="Press a key to assign, or clear:", font=("", 12)).pack(pady=(18, 6))
         display_var = ctk.StringVar(value=current if current else "— none —")
-        display_lbl = ctk.CTkLabel(dlg, textvariable=display_var, font=("", 14, "bold"))
-        display_lbl.pack(pady=4)
+        ctk.CTkLabel(dlg, textvariable=display_var, font=("", 14, "bold")).pack(pady=4)
 
         captured = {"key": current}
 
@@ -939,8 +1015,6 @@ class AutoMacroApp(ctk.CTk):
                         dlg.after(0, lambda n=name: display_var.set(n))
                         dlg.after(0, lambda: capture_btn.configure(state="normal"))
                         return
-                    time.sleep(0)
-                # keep polling
                 threading.Thread(target=poll, daemon=True).start()
 
             threading.Thread(target=poll, daemon=True).start()
@@ -948,8 +1022,7 @@ class AutoMacroApp(ctk.CTk):
         btn_row = ctk.CTkFrame(dlg, fg_color="transparent")
         btn_row.pack(pady=10)
 
-        capture_btn = ctk.CTkButton(btn_row, text="Record Key", width=110,
-                                     command=start_capture)
+        capture_btn = ctk.CTkButton(btn_row, text="Record Key", width=110, command=start_capture)
         capture_btn.pack(side="left", padx=4)
 
         def save():
@@ -958,7 +1031,6 @@ class AutoMacroApp(ctk.CTk):
             dlg.destroy()
 
         def clear():
-            captured["key"] = ""
             self.actions[index].pop("hotkey", None)
             self._refresh_action_list()
             dlg.destroy()
@@ -970,16 +1042,102 @@ class AutoMacroApp(ctk.CTk):
     # ── Dialogs ──────────────────────────────────────────────────────────
 
     def _edit_action(self, index: int):
-        action = self.actions[index]
-        atype = action.get("type")
-        if atype == "key":
-            self._dlg_add_key(edit_index=index)
-        elif atype == "click":
-            self._dlg_add_click(edit_index=index)
-        elif atype == "delay":
-            self._dlg_add_delay(edit_index=index)
-        elif atype == "type_string":
-            self._dlg_add_string(edit_index=index)
+        atype = self.actions[index].get("type")
+        dispatch = {
+            "key": self._dlg_add_key,
+            "combo": self._dlg_add_combo,
+            "click": self._dlg_add_click,
+            "delay": self._dlg_add_delay,
+            "type_string": self._dlg_add_string,
+        }
+        fn = dispatch.get(atype)
+        if fn:
+            fn(edit_index=index)
+
+    def _dlg_add_combo(self, edit_index: int | None = None):
+        editing = edit_index is not None
+        existing = self.actions[edit_index] if editing else {}
+        ex_keys: list[str] = existing.get("keys", [])
+
+        # Parse existing keys into modifiers + main key
+        ex_mods = {k.upper() for k in ex_keys if k.upper() in _MODIFIER_NAMES}
+        ex_main = next((k for k in ex_keys if k.upper() not in _MODIFIER_NAMES), "A")
+
+        dlg = ctk.CTkToplevel(self)
+        dlg.title("Edit Combo" if editing else "Add Combo")
+        dlg.geometry("340x300")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        ctk.CTkLabel(dlg, text="Modifiers:", anchor="w").pack(fill="x", padx=20, pady=(14, 4))
+
+        mod_frame = ctk.CTkFrame(dlg, fg_color="transparent")
+        mod_frame.pack(fill="x", padx=20)
+
+        ctrl_var = ctk.BooleanVar(value=any(m in ex_mods for m in ("CTRL", "LCTRL", "RCTRL")))
+        shift_var = ctk.BooleanVar(value=any(m in ex_mods for m in ("SHIFT", "LSHIFT", "RSHIFT")))
+        alt_var = ctk.BooleanVar(value=any(m in ex_mods for m in ("ALT", "LALT", "RALT")))
+
+        ctk.CTkCheckBox(mod_frame, text="Ctrl", variable=ctrl_var).pack(side="left", padx=(0, 12))
+        ctk.CTkCheckBox(mod_frame, text="Shift", variable=shift_var).pack(side="left", padx=(0, 12))
+        ctk.CTkCheckBox(mod_frame, text="Alt", variable=alt_var).pack(side="left")
+
+        ctk.CTkLabel(dlg, text="Main key:", anchor="w").pack(fill="x", padx=20, pady=(14, 4))
+        main_var = ctk.StringVar(value=ex_main)
+        ctk.CTkComboBox(dlg, values=ALL_KEY_NAMES, variable=main_var, width=280).pack(padx=20)
+
+        # Live preview
+        preview_var = ctk.StringVar()
+
+        def update_preview(*_):
+            parts = []
+            if ctrl_var.get():
+                parts.append("Ctrl")
+            if shift_var.get():
+                parts.append("Shift")
+            if alt_var.get():
+                parts.append("Alt")
+            parts.append(main_var.get().upper())
+            preview_var.set("+".join(parts))
+
+        ctrl_var.trace_add("write", update_preview)
+        shift_var.trace_add("write", update_preview)
+        alt_var.trace_add("write", update_preview)
+        main_var.trace_add("write", update_preview)
+        update_preview()
+
+        ctk.CTkLabel(dlg, textvariable=preview_var, font=("", 14, "bold"),
+                      text_color="#4ade80").pack(pady=8)
+
+        ctk.CTkLabel(dlg, text="Delay after (ms):", anchor="w").pack(fill="x", padx=20)
+        delay_var = ctk.StringVar(value=str(existing.get("delay", 50)))
+        ctk.CTkEntry(dlg, textvariable=delay_var, width=280).pack(padx=20, pady=4)
+
+        def submit():
+            keys = []
+            if ctrl_var.get():
+                keys.append("CTRL")
+            if shift_var.get():
+                keys.append("SHIFT")
+            if alt_var.get():
+                keys.append("ALT")
+            keys.append(main_var.get().upper())
+            try:
+                delay = int(delay_var.get())
+            except ValueError:
+                delay = 50
+            new_action = {"type": "combo", "keys": keys, "delay": max(0, delay)}
+            if editing:
+                if existing.get("hotkey"):
+                    new_action["hotkey"] = existing["hotkey"]
+                self.actions[edit_index] = new_action
+            else:
+                self.actions.append(new_action)
+            self._refresh_action_list()
+            dlg.destroy()
+
+        ctk.CTkButton(dlg, text="Save" if editing else "Add", command=submit).pack(pady=10)
 
     def _dlg_add_key(self, edit_index: int | None = None):
         editing = edit_index is not None
@@ -1014,10 +1172,9 @@ class AutoMacroApp(ctk.CTk):
                 "type": "key", "key": key_var.get(),
                 "action": action_var.get(), "delay": max(0, delay),
             }
+            if editing and existing.get("hotkey"):
+                new_action["hotkey"] = existing["hotkey"]
             if editing:
-                new_action["hotkey"] = existing.get("hotkey", "")
-                if not new_action["hotkey"]:
-                    new_action.pop("hotkey", None)
                 self.actions[edit_index] = new_action
             else:
                 self.actions.append(new_action)
@@ -1086,10 +1243,9 @@ class AutoMacroApp(ctk.CTk):
                 "type": "click", "x": x, "y": y,
                 "button": btn_var.get(), "delay": max(0, delay),
             }
+            if editing and existing.get("hotkey"):
+                new_action["hotkey"] = existing["hotkey"]
             if editing:
-                new_action["hotkey"] = existing.get("hotkey", "")
-                if not new_action["hotkey"]:
-                    new_action.pop("hotkey", None)
                 self.actions[edit_index] = new_action
             else:
                 self.actions.append(new_action)
@@ -1119,10 +1275,9 @@ class AutoMacroApp(ctk.CTk):
             except ValueError:
                 delay = 500
             new_action = {"type": "delay", "delay": max(0, delay)}
+            if editing and existing.get("hotkey"):
+                new_action["hotkey"] = existing["hotkey"]
             if editing:
-                new_action["hotkey"] = existing.get("hotkey", "")
-                if not new_action["hotkey"]:
-                    new_action.pop("hotkey", None)
                 self.actions[edit_index] = new_action
             else:
                 self.actions.append(new_action)
@@ -1158,10 +1313,9 @@ class AutoMacroApp(ctk.CTk):
             except ValueError:
                 delay = 0
             new_action = {"type": "type_string", "text": text, "delay": max(0, delay)}
+            if editing and existing.get("hotkey"):
+                new_action["hotkey"] = existing["hotkey"]
             if editing:
-                new_action["hotkey"] = existing.get("hotkey", "")
-                if not new_action["hotkey"]:
-                    new_action.pop("hotkey", None)
                 self.actions[edit_index] = new_action
             else:
                 self.actions.append(new_action)
@@ -1307,11 +1461,8 @@ class AutoMacroApp(ctk.CTk):
 
         self._overlay.update_idletasks()
         hwnd = ctypes.windll.user32.GetParent(self._overlay.winfo_id())
-        GWL_EXSTYLE = -20
-        style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-        ctypes.windll.user32.SetWindowLongW(
-            hwnd, GWL_EXSTYLE, style | 0x80000 | 0x20
-        )
+        style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
+        ctypes.windll.user32.SetWindowLongW(hwnd, -20, style | 0x80000 | 0x20)
 
         self._ov_canvas = tk.Canvas(
             self._overlay, width=D, height=D, bg=TRANS_COLOR, highlightthickness=0,

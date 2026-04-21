@@ -190,13 +190,13 @@ class InputSimulator:
 
     @staticmethod
     def send_combo(keys: list[str]):
-        """Send a key combo as a single batched SendInput call so modifiers are held atomically."""
+        """Hold modifiers, tap the main key, release — with delays so games register the hold."""
         vks = [vk_for_key(k) for k in keys]
         vks = [v for v in vks if v is not None]
         if not vks:
             return
 
-        def make_ki(vk: int, flags: int) -> INPUT:
+        def ki(vk: int, flags: int) -> INPUT:
             inp = INPUT()
             inp.type = INPUT_KEYBOARD
             inp.union.ki.wVk = vk
@@ -204,13 +204,24 @@ class InputSimulator:
             inp.union.ki.dwFlags = flags
             return inp
 
-        inputs = []
-        for vk in vks:                          # all keys down in order
-            inputs.append(make_ki(vk, 0))
-        for vk in reversed(vks):               # all keys up in reverse
-            inputs.append(make_ki(vk, KEYEVENTF_KEYUP))
+        modifiers = vks[:-1]
+        main = vks[-1]
 
-        InputSimulator._send(inputs)
+        # Press each modifier down individually so the game sees them held
+        for vk in modifiers:
+            InputSimulator._send([ki(vk, 0)])
+            time.sleep(0.02)
+
+        # Tap the main key while modifiers are held
+        InputSimulator._send([ki(main, 0)])
+        time.sleep(0.02)
+        InputSimulator._send([ki(main, KEYEVENTF_KEYUP)])
+        time.sleep(0.01)
+
+        # Release modifiers in reverse
+        for vk in reversed(modifiers):
+            InputSimulator._send([ki(vk, KEYEVENTF_KEYUP)])
+            time.sleep(0.01)
 
     @staticmethod
     def send_string(text: str):

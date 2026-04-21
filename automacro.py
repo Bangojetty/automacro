@@ -195,6 +195,11 @@ class InputSimulator:
         """Hold modifiers, tap the main key, release."""
         global _AUTOMACRO_HWND, _LAST_TARGET_HWND
 
+        # Generic modifier VKs (0x10/0x11/0x12) can have unreliable scan codes;
+        # always use the explicit left-side variants which have well-defined scancodes.
+        _norm = {"SHIFT": "LSHIFT", "CTRL": "LCTRL", "ALT": "LALT"}
+        keys = [_norm.get(k.upper(), k) for k in keys]
+
         vks = [vk_for_key(k) for k in keys]
 
         def log(msg):
@@ -1207,6 +1212,20 @@ class AutoMacroApp(ctk.CTk):
         delay = action.get("delay", 0)
         ctk.CTkLabel(row, text=f"{delay}ms", width=55, text_color="gray").pack(
             side="left", padx=3)
+
+        ctk.CTkLabel(row, text="\u00d7", width=14, text_color="gray").pack(side="left")
+        rep_var = ctk.StringVar(value=str(action.get("repeat", 1)))
+        rep_entry = ctk.CTkEntry(row, textvariable=rep_var, width=38, height=26,
+                                  justify="center")
+        rep_entry.pack(side="left", padx=(0, 4))
+
+        def _on_rep_change(name, index, mode, a=action, v=rep_var):
+            try:
+                a["repeat"] = max(1, int(v.get()))
+            except ValueError:
+                pass
+
+        rep_var.trace_add("write", _on_rep_change)
 
         bind_dblclick(row)
 

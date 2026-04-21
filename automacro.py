@@ -89,6 +89,10 @@ class INPUT(ctypes.Structure):
     ]
 
 
+# ─── Module-level focus tracking (for restoring window focus before input) ───
+_AUTOMACRO_HWND: int = 0
+_LAST_TARGET_HWND: int = 0
+
 # ─── Virtual Key Code Map ────────────────────────────────────────────────────
 
 VK_MAP = {
@@ -191,13 +195,27 @@ class InputSimulator:
     @staticmethod
     def send_combo(keys: list[str], debug_log=None):
         """Hold modifiers, tap the main key, release — with delays so the target registers the hold."""
+        global _AUTOMACRO_HWND, _LAST_TARGET_HWND
+
         vks = [vk_for_key(k) for k in keys]
 
         def log(msg):
             if debug_log:
                 debug_log(msg)
 
-        log(f"send_combo called: keys={keys}")
+        # Restore focus to the target window if AutoMacro stole it (e.g. button click)
+        if _AUTOMACRO_HWND and _LAST_TARGET_HWND:
+            current_fg = user32.GetForegroundWindow()
+            if current_fg == _AUTOMACRO_HWND:
+                log(f"  Focus is on AutoMacro — restoring to hwnd={hex(_LAST_TARGET_HWND)}")
+                user32.SetForegroundWindow(_LAST_TARGET_HWND)
+                time.sleep(0.08)
+
+        # Log which window has focus at time of combo
+        buf = ctypes.create_unicode_buffer(256)
+        hwnd = user32.GetForegroundWindow()
+        user32.GetWindowTextW(hwnd, buf, 256)
+        log(f"send_combo called: keys={keys}  focused_window='{buf.value}'")
         log(f"  resolved VKs (before filter): {[hex(v) if v else None for v in vks]}")
 
         vks = [v for v in vks if v is not None]
@@ -714,11 +732,29 @@ class AutoMacroApp(ctk.CTk):
         self.action_hotkey_mgr = MultiHotkeyManager()
         self._action_hids: list[int] = []
 
+        self._actions_placeholder: ctk.CTkLabel | None = None
+
         self._build_ui()
         self._create_overlay()
         self._refresh_action_list()
         self._update_status("Stopped")
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(200, self._init_focus_tracking)
+
+    # ── Focus Tracking ───────────────────────────────────────────────────
+
+    def _init_focus_tracking(self):
+        global _AUTOMACRO_HWND
+        _AUTOMACRO_HWND = user32.GetForegroundWindow()
+        threading.Thread(target=self._foreground_tracker, daemon=True).start()
+
+    def _foreground_tracker(self):
+        global _LAST_TARGET_HWND, _AUTOMACRO_HWND
+        while True:
+            hwnd = user32.GetForegroundWindow()
+            if hwnd and hwnd != _AUTOMACRO_HWND:
+                _LAST_TARGET_HWND = hwnd
+            time.sleep(0.15)
 
     # ── UI Construction ──────────────────────────────────────────────────
 
@@ -926,68 +962,93 @@ class AutoMacroApp(ctk.CTk):
 
     # ── Action List Rendering ────────────────────────────────────────────
 
+    def _build_action_row(self, i: int, action: dict):
+        row = ctk.CTkFrame(self.action_frame)
+        row.pack(fill="x", pady=2, padx=2)
+
+        def bind_dblclick(widget, idx=i):
+            widget.bind("<Double-Button-1>", lambda e, j=idx: self._edit_action(j))
+            for child in widget.winfo_children():
+                bind_dblclick(child, idx)
+
+        ctk.CTkLabel(row, text=f"#{i+1}", width=30, font=("", 12, "bold")).pack(
+            side="left", padx=(5, 3))
+
+        desc = self._describe_action(action)
+        ctk.CTkLabel(row, text=desc, anchor="w").pack(side="left", fill="x", expand=True)
+
+        delay = action.get("delay", 0)
+        ctk.CTkLabel(row, text=f"{delay}ms", width=55, text_color="gray").pack(
+            side="left", padx=3)
+
+        bind_dblclick(row)
+
+        ctk.CTkButton(
+            row, text="\u25b6", width=28, height=28,
+            fg_color="#2d6a8a", hover_color="#3a85ad",
+            command=lambda a=action: self._run_single_action(a),
+        ).pack(side="left", padx=1)
+
+        hk = action.get("hotkey", "")
+        ctk.CTkButton(
+            row, text=hk if hk else "+", width=46, height=28,
+            fg_color="#2d5a2d" if hk else "#3a3a3a",
+            hover_color="#3a7a3a" if hk else "#4a4a4a",
+            font=("", 11),
+            command=lambda idx=i: self._record_action_hotkey(idx),
+        ).pack(side="left", padx=1)
+
+        if i > 0:
+            ctk.CTkButton(
+                row, text="\u25b2", width=28, height=28,
+                command=lambda idx=i: self._move_action(idx, -1),
+            ).pack(side="left", padx=1)
+        if i < len(self.actions) - 1:
+            ctk.CTkButton(
+                row, text="\u25bc", width=28, height=28,
+                command=lambda idx=i: self._move_action(idx, 1),
+            ).pack(side="left", padx=1)
+        ctk.CTkButton(
+            row, text="\u2715", width=28, height=28,
+            fg_color="#aa3333", hover_color="#cc4444",
+            command=lambda idx=i: self._delete_action(idx),
+        ).pack(side="left", padx=(1, 5))
+
+    def _append_action_row(self, action: dict):
+        """Add one row for the last action in self.actions without rebuilding the list."""
+        i = len(self.actions) - 1
+
+        # Remove the placeholder label if present
+        if self._actions_placeholder is not None:
+            self._actions_placeholder.destroy()
+            self._actions_placeholder = None
+
+        # Register hotkey for this action if it has one
+        hk = action.get("hotkey", "")
+        if hk:
+            hid = self.action_hotkey_mgr.register(hk, lambda a=action: self._run_single_action(a))
+        else:
+            hid = -1
+        self._action_hids.append(hid)
+
+        self._build_action_row(i, action)
+
     def _refresh_action_list(self):
         for w in self.action_frame.winfo_children():
             w.destroy()
+        self._actions_placeholder = None
 
         self._rebuild_action_hotkeys()
 
         if not self.actions:
-            ctk.CTkLabel(self.action_frame, text="No actions yet. Add some above.",
-                          text_color="gray").pack(pady=20)
+            self._actions_placeholder = ctk.CTkLabel(
+                self.action_frame, text="No actions yet. Add some above.", text_color="gray"
+            )
+            self._actions_placeholder.pack(pady=20)
             return
 
         for i, action in enumerate(self.actions):
-            row = ctk.CTkFrame(self.action_frame)
-            row.pack(fill="x", pady=2, padx=2)
-
-            def bind_dblclick(widget, idx=i):
-                widget.bind("<Double-Button-1>", lambda e, j=idx: self._edit_action(j))
-                for child in widget.winfo_children():
-                    bind_dblclick(child, idx)
-
-            ctk.CTkLabel(row, text=f"#{i+1}", width=30, font=("", 12, "bold")).pack(
-                side="left", padx=(5, 3))
-
-            desc = self._describe_action(action)
-            ctk.CTkLabel(row, text=desc, anchor="w").pack(side="left", fill="x", expand=True)
-
-            delay = action.get("delay", 0)
-            ctk.CTkLabel(row, text=f"{delay}ms", width=55, text_color="gray").pack(
-                side="left", padx=3)
-
-            bind_dblclick(row)
-
-            ctk.CTkButton(
-                row, text="\u25b6", width=28, height=28,
-                fg_color="#2d6a8a", hover_color="#3a85ad",
-                command=lambda a=action: self._run_single_action(a),
-            ).pack(side="left", padx=1)
-
-            hk = action.get("hotkey", "")
-            ctk.CTkButton(
-                row, text=hk if hk else "+", width=46, height=28,
-                fg_color="#2d5a2d" if hk else "#3a3a3a",
-                hover_color="#3a7a3a" if hk else "#4a4a4a",
-                font=("", 11),
-                command=lambda idx=i: self._record_action_hotkey(idx),
-            ).pack(side="left", padx=1)
-
-            if i > 0:
-                ctk.CTkButton(
-                    row, text="\u25b2", width=28, height=28,
-                    command=lambda idx=i: self._move_action(idx, -1),
-                ).pack(side="left", padx=1)
-            if i < len(self.actions) - 1:
-                ctk.CTkButton(
-                    row, text="\u25bc", width=28, height=28,
-                    command=lambda idx=i: self._move_action(idx, 1),
-                ).pack(side="left", padx=1)
-            ctk.CTkButton(
-                row, text="\u2715", width=28, height=28,
-                fg_color="#aa3333", hover_color="#cc4444",
-                command=lambda idx=i: self._delete_action(idx),
-            ).pack(side="left", padx=(1, 5))
+            self._build_action_row(i, action)
 
     @staticmethod
     def _describe_action(action: dict) -> str:
@@ -1202,9 +1263,10 @@ class AutoMacroApp(ctk.CTk):
                 if existing.get("hotkey"):
                     new_action["hotkey"] = existing["hotkey"]
                 self.actions[edit_index] = new_action
+                self._refresh_action_list()
             else:
                 self.actions.append(new_action)
-            self._refresh_action_list()
+                self._append_action_row(new_action)
             dlg.destroy()
 
         ctk.CTkButton(dlg, text="Save" if editing else "Add", command=submit).pack(pady=10)
@@ -1283,9 +1345,10 @@ class AutoMacroApp(ctk.CTk):
                 new_action["hotkey"] = existing["hotkey"]
             if editing:
                 self.actions[edit_index] = new_action
+                self._refresh_action_list()
             else:
                 self.actions.append(new_action)
-            self._refresh_action_list()
+                self._append_action_row(new_action)
             dlg.destroy()
 
         ctk.CTkButton(dlg, text="Save" if editing else "Add", command=submit).pack(pady=10)
@@ -1361,9 +1424,10 @@ class AutoMacroApp(ctk.CTk):
                 new_action["hotkey"] = existing["hotkey"]
             if editing:
                 self.actions[edit_index] = new_action
+                self._refresh_action_list()
             else:
                 self.actions.append(new_action)
-            self._refresh_action_list()
+                self._append_action_row(new_action)
             dlg.destroy()
 
         ctk.CTkButton(dlg, text="Save" if editing else "Add", command=submit).pack(pady=10)
@@ -1400,9 +1464,10 @@ class AutoMacroApp(ctk.CTk):
                 new_action["hotkey"] = existing["hotkey"]
             if editing:
                 self.actions[edit_index] = new_action
+                self._refresh_action_list()
             else:
                 self.actions.append(new_action)
-            self._refresh_action_list()
+                self._append_action_row(new_action)
             dlg.destroy()
 
         ctk.CTkButton(dlg, text="Save" if editing else "Add", command=submit).pack(pady=10)
@@ -1445,9 +1510,10 @@ class AutoMacroApp(ctk.CTk):
                 new_action["hotkey"] = existing["hotkey"]
             if editing:
                 self.actions[edit_index] = new_action
+                self._refresh_action_list()
             else:
                 self.actions.append(new_action)
-            self._refresh_action_list()
+                self._append_action_row(new_action)
             dlg.destroy()
 
         ctk.CTkButton(dlg, text="Save" if editing else "Add", command=submit).pack(pady=8)
@@ -1493,7 +1559,7 @@ class AutoMacroApp(ctk.CTk):
             self._stop_input_recording()
             return
         self.actions.append(action)
-        self._refresh_action_list()
+        self._append_action_row(action)
 
     def _on_infinite_toggle(self):
         self.repeat_entry.configure(

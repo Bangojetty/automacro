@@ -190,19 +190,27 @@ class InputSimulator:
 
     @staticmethod
     def send_combo(keys: list[str]):
-        """Press modifier keys, tap the final key, release modifiers."""
+        """Send a key combo as a single batched SendInput call so modifiers are held atomically."""
         vks = [vk_for_key(k) for k in keys]
         vks = [v for v in vks if v is not None]
         if not vks:
             return
-        # Hold all but the last, tap the last, then release in reverse
-        for vk in vks[:-1]:
-            InputSimulator.send_key_down(vk)
-            time.sleep(0.005)
-        InputSimulator.send_key_tap(vks[-1])
-        for vk in reversed(vks[:-1]):
-            InputSimulator.send_key_up(vk)
-            time.sleep(0.005)
+
+        def make_ki(vk: int, flags: int) -> INPUT:
+            inp = INPUT()
+            inp.type = INPUT_KEYBOARD
+            inp.union.ki.wVk = vk
+            inp.union.ki.wScan = user32.MapVirtualKeyW(vk, 0)
+            inp.union.ki.dwFlags = flags
+            return inp
+
+        inputs = []
+        for vk in vks:                          # all keys down in order
+            inputs.append(make_ki(vk, 0))
+        for vk in reversed(vks):               # all keys up in reverse
+            inputs.append(make_ki(vk, KEYEVENTF_KEYUP))
+
+        InputSimulator._send(inputs)
 
     @staticmethod
     def send_string(text: str):

@@ -130,7 +130,6 @@ _OTHER = sorted(set(VK_MAP.keys()) - set(_LETTERS) - set(_DIGITS) - set(_FKEYS)
                 - set(_MODIFIERS) - set(_NAVIGATION) - set(_NUMPAD))
 ALL_KEY_NAMES = _LETTERS + _DIGITS + _FKEYS + _MODIFIERS + _NAVIGATION + _NUMPAD + _OTHER
 
-# Modifier key names used for combo detection
 _MODIFIER_NAMES = frozenset({"CTRL", "LCTRL", "RCTRL", "SHIFT", "LSHIFT", "RSHIFT",
                               "ALT", "LALT", "RALT"})
 
@@ -140,7 +139,6 @@ def vk_for_key(name: str) -> int | None:
 
 
 def combo_display(keys: list[str]) -> str:
-    """Human-readable combo string, e.g. ['LCTRL', 'C'] → 'Ctrl+C'."""
     parts = []
     for k in keys:
         ku = k.upper()
@@ -194,7 +192,7 @@ class InputSimulator:
 
     @staticmethod
     def send_combo(keys: list[str], debug_log=None):
-        """Hold modifiers, tap the main key, release — with delays so the target registers the hold."""
+        """Hold modifiers, tap the main key, release."""
         global _AUTOMACRO_HWND, _LAST_TARGET_HWND
 
         vks = [vk_for_key(k) for k in keys]
@@ -211,7 +209,6 @@ class InputSimulator:
                 user32.SetForegroundWindow(_LAST_TARGET_HWND)
                 time.sleep(0.08)
 
-        # Log which window has focus at time of combo
         buf = ctypes.create_unicode_buffer(256)
         hwnd = user32.GetForegroundWindow()
         user32.GetWindowTextW(hwnd, buf, 256)
@@ -234,7 +231,6 @@ class InputSimulator:
         def send_and_log(vk: int, flags: int, label: str):
             scan = user32.MapVirtualKeyW(vk, 0)
             log(f"  {label}: vk={hex(vk)} scan={hex(scan)} flags={hex(flags)}")
-            n = len([ki(vk, flags)])
             arr = (INPUT * 1)(ki(vk, flags))
             result = user32.SendInput(1, ctypes.pointer(arr), ctypes.sizeof(INPUT))
             log(f"    SendInput returned {result} (expected 1)")
@@ -315,12 +311,7 @@ class InputSimulator:
 # ─── InputRecorder ───────────────────────────────────────────────────────────
 
 class InputRecorder:
-    """Capture live keyboard and mouse events and build an action list.
-
-    Multi-key combos: when a modifier (Ctrl/Shift/Alt) is held while a
-    non-modifier key is pressed, they are grouped into a single combo action
-    instead of being recorded as separate key presses.
-    """
+    """Capture live keyboard and mouse events and build an action list."""
 
     _PYNPUT_KEY_MAP = {
         pynput_kb.Key.space: "SPACE",
@@ -360,8 +351,8 @@ class InputRecorder:
         self._mouse_listener = None
         self._last_time = None
         self.recording = False
-        self._held_modifiers: set[str] = set()   # modifiers currently down
-        self._used_in_combo: set[str] = set()    # modifiers already consumed by a combo
+        self._held_modifiers: set[str] = set()
+        self._used_in_combo: set[str] = set()
 
     def start(self):
         self.recording = True
@@ -407,18 +398,13 @@ class InputRecorder:
         if name is None:
             return
         name_upper = name.upper()
-
         if name_upper == self._stop_key:
             return
-
         if name_upper in _MODIFIER_NAMES:
-            # Track but don't emit yet — wait to see if used in a combo
             self._held_modifiers.add(name_upper)
         else:
             delay = self._elapsed_ms()
             if self._held_modifiers:
-                # Group held modifiers + this key into a combo
-                # Order: Ctrl, Shift, Alt, then the main key
                 ordered_mods = _order_modifiers(self._held_modifiers)
                 keys = ordered_mods + [name_upper]
                 self._emit({"type": "combo", "keys": keys, "delay": delay})
@@ -435,7 +421,6 @@ class InputRecorder:
         name_upper = name.upper()
         if name_upper in _MODIFIER_NAMES:
             if name_upper not in self._used_in_combo:
-                # Standalone modifier press (not part of any combo) — emit it now
                 delay = self._elapsed_ms()
                 self._emit({"type": "key", "key": name_upper, "action": "tap", "delay": delay})
             self._held_modifiers.discard(name_upper)
@@ -464,7 +449,6 @@ class InputRecorder:
 
 
 def _order_modifiers(mods: set[str]) -> list[str]:
-    """Return modifiers in a canonical order: Ctrl, Shift, Alt."""
     order = ["CTRL", "LCTRL", "RCTRL", "SHIFT", "LSHIFT", "RSHIFT", "ALT", "LALT", "RALT"]
     return [m for m in order if m in mods]
 
@@ -472,7 +456,7 @@ def _order_modifiers(mods: set[str]) -> list[str]:
 # ─── MacroEngine ─────────────────────────────────────────────────────────────
 
 class MacroEngine:
-    """Execute a list of macro actions in a background thread."""
+    """Execute a list of sequences (each with their own action list) in a background thread."""
 
     _log_path = Path(__file__).parent / "automacro.log"
 
@@ -492,12 +476,12 @@ class MacroEngine:
         except Exception:
             pass
 
-    def start(self, actions: list[dict], repeat: int):
+    def start(self, sequences: list[dict], repeat: int):
         if self.running:
             return
         self._stop_event.clear()
         self.running = True
-        self._thread = threading.Thread(target=self._run, args=(actions, repeat), daemon=True)
+        self._thread = threading.Thread(target=self._run, args=(sequences, repeat), daemon=True)
         self._thread.start()
         if self._on_status:
             self._on_status("running")
@@ -508,7 +492,7 @@ class MacroEngine:
         if self._on_status:
             self._on_status("stopped")
 
-    def _run(self, actions: list[dict], repeat: int):
+    def _run(self, sequences: list[dict], repeat: int):
         iteration = 0
         try:
             while not self._stop_event.is_set():
@@ -519,19 +503,29 @@ class MacroEngine:
                     else:
                         self._on_status(f"running (loop {iteration}/{repeat})")
 
-                for action in actions:
+                for seq in sequences:
                     if self._stop_event.is_set():
                         break
-                    action_repeat = max(1, action.get("repeat", 1))
-                    for _ in range(action_repeat):
+                    seq_repeat = max(1, seq.get("repeat", 1))
+                    for _ in range(seq_repeat):
                         if self._stop_event.is_set():
                             break
-                        self._execute_action(action)
-                        if self._on_action:
-                            self._on_action()
-                        delay_ms = action.get("delay", 0)
-                        if delay_ms > 0:
-                            self._interruptible_sleep(delay_ms / 1000.0)
+                        for action in seq.get("actions", []):
+                            if self._stop_event.is_set():
+                                break
+                            action_repeat = max(1, action.get("repeat", 1))
+                            for _ in range(action_repeat):
+                                if self._stop_event.is_set():
+                                    break
+                                self._execute_action(action)
+                                if self._on_action:
+                                    self._on_action()
+                                delay_ms = action.get("delay", 0)
+                                if delay_ms > 0:
+                                    self._interruptible_sleep(delay_ms / 1000.0)
+                        seq_delay = seq.get("delay", 0)
+                        if seq_delay > 0 and not self._stop_event.is_set():
+                            self._interruptible_sleep(seq_delay / 1000.0)
 
                 if repeat != 0 and iteration >= repeat:
                     break
@@ -711,16 +705,17 @@ class AutoMacroApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("AutoMacro")
-        self.geometry("820x720")
-        self.minsize(720, 550)
+        self.geometry("860x740")
+        self.minsize(760, 580)
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
         self.PRESETS_DIR.mkdir(exist_ok=True)
 
-        self.actions: list[dict] = []
+        self.sequences: list[dict] = []
         self.hotkey = "F6"
         self.macro_name = "Untitled"
+        self._editing_seq_index: int | None = None
 
         self._recording_hotkey = False
         self._input_recording = False
@@ -729,14 +724,16 @@ class AutoMacroApp(ctk.CTk):
                                    on_action=self._on_engine_action)
         self.hotkey_mgr = GlobalHotkeyManager(self.hotkey, self._toggle_macro)
         self.recorder = InputRecorder(on_action=self._on_recorded_action, stop_key="F8")
-        self.action_hotkey_mgr = MultiHotkeyManager()
-        self._action_hids: list[int] = []
+        self.seq_hotkey_mgr = MultiHotkeyManager()
+        self._seq_hids: list[int] = []
 
+        # Placeholder refs for fast-append path
+        self._seq_placeholder: ctk.CTkLabel | None = None
         self._actions_placeholder: ctk.CTkLabel | None = None
 
         self._build_ui()
         self._create_overlay()
-        self._refresh_action_list()
+        self._refresh_seq_list()
         self._update_status("Stopped")
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(200, self._init_focus_tracking)
@@ -771,7 +768,7 @@ class AutoMacroApp(ctk.CTk):
         self._tab_buttons: dict[str, ctk.CTkButton] = {}
         self._tab_frames: dict[str, ctk.CTkFrame] = {}
 
-        for name, label in [("macro", "  Macro"), ("presets", "  Presets")]:
+        for name, label in [("sequences", "  Sequences"), ("presets", "  Presets")]:
             btn = ctk.CTkButton(
                 sidebar, text=label, width=130, height=38,
                 fg_color="transparent", hover_color="#2a2d2e",
@@ -784,17 +781,22 @@ class AutoMacroApp(ctk.CTk):
         content = ctk.CTkFrame(outer, fg_color="transparent")
         content.pack(side="left", fill="both", expand=True, padx=10, pady=10)
 
-        macro_frame = ctk.CTkFrame(content)
-        self._tab_frames["macro"] = macro_frame
-        self._build_macro_tab(macro_frame)
+        seq_frame = ctk.CTkFrame(content)
+        self._tab_frames["sequences"] = seq_frame
+        self._build_sequences_tab(seq_frame)
 
         presets_frame = ctk.CTkFrame(content)
         self._tab_frames["presets"] = presets_frame
         self._build_presets_tab(presets_frame)
 
-        self._switch_tab("macro")
+        self._switch_tab("sequences")
 
     def _switch_tab(self, name: str):
+        # Save any open sequence edits before leaving
+        if name != "sequences" and self._editing_seq_index is not None:
+            self._save_seq_edits()
+            self._show_seq_list_panel()
+
         for f in self._tab_frames.values():
             f.pack_forget()
         self._tab_frames[name].pack(fill="both", expand=True)
@@ -807,27 +809,100 @@ class AutoMacroApp(ctk.CTk):
         if name == "presets":
             self._refresh_presets()
 
-    def _build_macro_tab(self, parent):
-        name_row = ctk.CTkFrame(parent, fg_color="transparent")
+    # ── Sequences Tab ────────────────────────────────────────────────────
+
+    def _build_sequences_tab(self, parent):
+        # ── List panel ──
+        self._seq_list_panel = ctk.CTkFrame(parent, fg_color="transparent")
+
+        name_row = ctk.CTkFrame(self._seq_list_panel, fg_color="transparent")
         name_row.pack(fill="x", padx=10, pady=(10, 4))
         ctk.CTkLabel(name_row, text="Name:", width=50).pack(side="left")
         self.name_var = ctk.StringVar(value=self.macro_name)
-        ctk.CTkEntry(name_row, textvariable=self.name_var, width=220).pack(side="left", padx=6)
-
-        # Default delay — top-right
+        ctk.CTkEntry(name_row, textvariable=self.name_var, width=200).pack(side="left", padx=6)
         ctk.CTkLabel(name_row, text="Default delay (ms):").pack(side="right", padx=(6, 0))
         self.default_delay_var = ctk.StringVar(value="10")
         ctk.CTkEntry(name_row, textvariable=self.default_delay_var, width=70).pack(side="right")
 
-        ctk.CTkLabel(parent, text="Actions", font=("", 15, "bold"), anchor="w").pack(
-            fill="x", padx=10, pady=(4, 2)
+        ctk.CTkLabel(self._seq_list_panel, text="Sequences", font=("", 15, "bold"),
+                      anchor="w").pack(fill="x", padx=10, pady=(4, 2))
+
+        self.seq_frame = ctk.CTkScrollableFrame(self._seq_list_panel, height=280)
+        self.seq_frame.pack(fill="both", expand=True, padx=10, pady=(0, 6))
+
+        add_row = ctk.CTkFrame(self._seq_list_panel, fg_color="transparent")
+        add_row.pack(fill="x", padx=10, pady=(0, 8))
+        ctk.CTkButton(add_row, text="+ Add Sequence", width=140,
+                       fg_color="#2d6a8a", hover_color="#3a85ad",
+                       command=self._add_sequence).pack(side="left")
+
+        ctrl1 = ctk.CTkFrame(self._seq_list_panel)
+        ctrl1.pack(fill="x", padx=10, pady=(0, 6))
+
+        ctk.CTkLabel(ctrl1, text="Repeat:").pack(side="left", padx=(10, 5))
+        self.repeat_var = ctk.StringVar(value="1")
+        self.repeat_entry = ctk.CTkEntry(ctrl1, width=60, textvariable=self.repeat_var)
+        self.repeat_entry.pack(side="left", padx=(0, 5))
+
+        self.infinite_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(ctrl1, text="Infinite", variable=self.infinite_var,
+                         command=self._on_infinite_toggle).pack(side="left", padx=(0, 16))
+
+        ctk.CTkLabel(ctrl1, text="Hotkey:").pack(side="left", padx=(10, 5))
+        self.hotkey_label = ctk.CTkLabel(ctrl1, text=self.hotkey, width=55,
+                                          font=("", 13, "bold"))
+        self.hotkey_label.pack(side="left", padx=(0, 5))
+        self.record_hotkey_btn = ctk.CTkButton(
+            ctrl1, text="Record", width=70, command=self._start_hotkey_recording,
         )
+        self.record_hotkey_btn.pack(side="left", padx=(0, 8))
+        self.hotkey_enabled_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(ctrl1, text="Enabled", variable=self.hotkey_enabled_var,
+                         command=self._on_hotkey_toggle).pack(side="left")
 
-        self.action_frame = ctk.CTkScrollableFrame(parent, height=260)
-        self.action_frame.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+        ctrl2 = ctk.CTkFrame(self._seq_list_panel, fg_color="transparent")
+        ctrl2.pack(fill="x", padx=10, pady=(0, 6))
+        self.start_btn = ctk.CTkButton(
+            ctrl2, text="Start (F6)", height=36,
+            fg_color="#2d8a4e", hover_color="#36a85c",
+            command=self._toggle_macro,
+        )
+        self.start_btn.pack(fill="x")
 
-        # Add buttons — row 1
-        btn_row1 = ctk.CTkFrame(parent, fg_color="transparent")
+        self.status_label = ctk.CTkLabel(self._seq_list_panel, text="Stopped",
+                                          anchor="w", font=("", 12))
+        self.status_label.pack(fill="x", padx=10)
+
+        # ── Edit panel ──
+        self._seq_edit_panel = ctk.CTkFrame(parent, fg_color="transparent")
+
+        edit_header = ctk.CTkFrame(self._seq_edit_panel, fg_color="transparent")
+        edit_header.pack(fill="x", padx=10, pady=(10, 4))
+        ctk.CTkButton(edit_header, text="← Back", width=80,
+                       command=self._back_to_seq_list).pack(side="left", padx=(0, 12))
+        ctk.CTkLabel(edit_header, text="Name:").pack(side="left")
+        self.seq_name_var = ctk.StringVar(value="")
+        ctk.CTkEntry(edit_header, textvariable=self.seq_name_var, width=220).pack(
+            side="left", padx=6)
+
+        meta_row = ctk.CTkFrame(self._seq_edit_panel, fg_color="transparent")
+        meta_row.pack(fill="x", padx=10, pady=(0, 6))
+        ctk.CTkLabel(meta_row, text="Repeat:").pack(side="left")
+        self.seq_repeat_var = ctk.StringVar(value="1")
+        ctk.CTkEntry(meta_row, textvariable=self.seq_repeat_var, width=60).pack(
+            side="left", padx=(4, 20))
+        ctk.CTkLabel(meta_row, text="Delay after (ms):").pack(side="left")
+        self.seq_delay_var = ctk.StringVar(value="0")
+        ctk.CTkEntry(meta_row, textvariable=self.seq_delay_var, width=70).pack(
+            side="left", padx=4)
+
+        ctk.CTkLabel(self._seq_edit_panel, text="Actions", font=("", 14, "bold"),
+                      anchor="w").pack(fill="x", padx=10, pady=(4, 2))
+
+        self.action_frame = ctk.CTkScrollableFrame(self._seq_edit_panel, height=240)
+        self.action_frame.pack(fill="both", expand=True, padx=10, pady=(0, 6))
+
+        btn_row1 = ctk.CTkFrame(self._seq_edit_panel, fg_color="transparent")
         btn_row1.pack(fill="x", padx=10, pady=(0, 4))
         ctk.CTkButton(btn_row1, text="Add Key", width=95,
                        command=self._dlg_add_key).pack(side="left", padx=(0, 4))
@@ -840,8 +915,7 @@ class AutoMacroApp(ctk.CTk):
         ctk.CTkButton(btn_row1, text="Add Text", width=90,
                        command=self._dlg_add_string).pack(side="left", padx=(0, 4))
 
-        # Add buttons — row 2
-        btn_row2 = ctk.CTkFrame(parent, fg_color="transparent")
+        btn_row2 = ctk.CTkFrame(self._seq_edit_panel, fg_color="transparent")
         btn_row2.pack(fill="x", padx=10, pady=(0, 8))
         self.record_input_btn = ctk.CTkButton(
             btn_row2, text="Record Inputs (F8)", width=160,
@@ -853,275 +927,140 @@ class AutoMacroApp(ctk.CTk):
                        fg_color="#aa3333", hover_color="#cc4444",
                        command=self._clear_actions).pack(side="left")
 
-        ctrl1 = ctk.CTkFrame(parent)
-        ctrl1.pack(fill="x", padx=10, pady=(0, 6))
+        # Start with the list panel visible
+        self._show_seq_list_panel()
 
-        ctk.CTkLabel(ctrl1, text="Repeat:").pack(side="left", padx=(10, 5))
-        self.repeat_var = ctk.StringVar(value="1")
-        self.repeat_entry = ctk.CTkEntry(ctrl1, width=60, textvariable=self.repeat_var)
-        self.repeat_entry.pack(side="left", padx=(0, 5))
+    def _show_seq_list_panel(self):
+        self._seq_edit_panel.pack_forget()
+        self._seq_list_panel.pack(fill="both", expand=True)
 
-        self.infinite_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(ctrl1, text="Infinite", variable=self.infinite_var,
-                         command=self._on_infinite_toggle).pack(side="left", padx=(0, 20))
+    def _show_seq_edit_panel(self):
+        self._seq_list_panel.pack_forget()
+        self._seq_edit_panel.pack(fill="both", expand=True)
 
-        ctk.CTkLabel(ctrl1, text="Hotkey:").pack(side="left", padx=(10, 5))
-        self.hotkey_label = ctk.CTkLabel(ctrl1, text=self.hotkey, width=60,
-                                          font=("", 13, "bold"))
-        self.hotkey_label.pack(side="left", padx=(0, 5))
-        self.record_hotkey_btn = ctk.CTkButton(
-            ctrl1, text="Record", width=70, command=self._start_hotkey_recording,
-        )
-        self.record_hotkey_btn.pack(side="left", padx=(0, 10))
+    # ── Sequence List ────────────────────────────────────────────────────
 
-        ctrl2 = ctk.CTkFrame(parent, fg_color="transparent")
-        ctrl2.pack(fill="x", padx=10, pady=(0, 6))
-        self.start_btn = ctk.CTkButton(
-            ctrl2, text="Start (F6)", height=36,
-            fg_color="#2d8a4e", hover_color="#36a85c",
-            command=self._toggle_macro,
-        )
-        self.start_btn.pack(fill="x")
-
-        self.status_label = ctk.CTkLabel(parent, text="Stopped", anchor="w", font=("", 12))
-        self.status_label.pack(fill="x", padx=10)
-
-    def _build_presets_tab(self, parent):
-        header = ctk.CTkFrame(parent, fg_color="transparent")
-        header.pack(fill="x", padx=10, pady=(12, 8))
-        ctk.CTkLabel(header, text="Presets", font=("", 15, "bold")).pack(side="left")
-        ctk.CTkButton(header, text="Save Current", width=120,
-                       command=self._save_preset).pack(side="right")
-
-        self.preset_frame = ctk.CTkScrollableFrame(parent)
-        self.preset_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-
-    # ── Presets ──────────────────────────────────────────────────────────
-
-    def _refresh_presets(self):
-        for w in self.preset_frame.winfo_children():
+    def _refresh_seq_list(self):
+        for w in self.seq_frame.winfo_children():
             w.destroy()
-        files = sorted(self.PRESETS_DIR.glob("*.json"))
-        if not files:
-            ctk.CTkLabel(self.preset_frame, text="No presets saved yet.",
-                          text_color="gray").pack(pady=20)
+        self._seq_placeholder = None
+        self._rebuild_seq_hotkeys()
+
+        if not self.sequences:
+            self._seq_placeholder = ctk.CTkLabel(
+                self.seq_frame, text="No sequences yet. Click '+ Add Sequence' to begin.",
+                text_color="gray",
+            )
+            self._seq_placeholder.pack(pady=20)
             return
-        for path in files:
-            row = ctk.CTkFrame(self.preset_frame)
-            row.pack(fill="x", pady=3, padx=2)
-            ctk.CTkLabel(row, text=path.stem, anchor="w", font=("", 13)).pack(
-                side="left", fill="x", expand=True, padx=10)
-            ctk.CTkButton(row, text="Load", width=70,
-                           command=lambda p=path: self._load_preset_file(p)).pack(
-                side="left", padx=4)
-            ctk.CTkButton(row, text="\u2715", width=32, height=28,
-                           fg_color="#aa3333", hover_color="#cc4444",
-                           command=lambda p=path: self._delete_preset(p)).pack(
-                side="left", padx=(0, 6))
 
-    def _save_preset(self):
-        name = self.name_var.get().strip() or "Untitled"
-        safe = "".join(c if c.isalnum() or c in " _-" else "_" for c in name)
-        path = self.PRESETS_DIR / f"{safe}.json"
-        repeat = 0 if self.infinite_var.get() else int(self.repeat_var.get() or 1)
-        data = {"name": name, "hotkey": self.hotkey, "repeat": repeat, "actions": self.actions}
-        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        self._switch_tab("presets")
+        for i, seq in enumerate(self.sequences):
+            self._build_seq_row(i, seq)
 
-    def _load_preset_file(self, path: Path):
-        data = json.loads(path.read_text(encoding="utf-8"))
-        self._apply_macro_data(data)
-        self._switch_tab("macro")
-
-    def _delete_preset(self, path: Path):
-        path.unlink(missing_ok=True)
-        self._refresh_presets()
-
-    def _apply_macro_data(self, data: dict):
-        self.actions = data.get("actions", [])
-        name = data.get("name", "Untitled")
-        hotkey = data.get("hotkey", "F6")
-        repeat = data.get("repeat", 1)
-
-        self.macro_name = name
-        self.name_var.set(name)
-        self.hotkey = hotkey
-        self.hotkey_label.configure(text=hotkey)
-        self.start_btn.configure(text=f"Start ({hotkey})")
-        self.hotkey_mgr.set_hotkey(hotkey)
-
-        if repeat == 0:
-            self.infinite_var.set(True)
-            self._on_infinite_toggle()
-        else:
-            self.infinite_var.set(False)
-            self._on_infinite_toggle()
-            self.repeat_var.set(str(repeat))
-
-        self._refresh_action_list()
-
-    # ── Action List Rendering ────────────────────────────────────────────
-
-    def _build_action_row(self, i: int, action: dict):
-        row = ctk.CTkFrame(self.action_frame)
+    def _build_seq_row(self, i: int, seq: dict):
+        row = ctk.CTkFrame(self.seq_frame)
         row.pack(fill="x", pady=2, padx=2)
-
-        def bind_dblclick(widget, idx=i):
-            widget.bind("<Double-Button-1>", lambda e, j=idx: self._edit_action(j))
-            for child in widget.winfo_children():
-                bind_dblclick(child, idx)
 
         ctk.CTkLabel(row, text=f"#{i+1}", width=30, font=("", 12, "bold")).pack(
             side="left", padx=(5, 3))
 
-        desc = self._describe_action(action)
-        ctk.CTkLabel(row, text=desc, anchor="w").pack(side="left", fill="x", expand=True)
+        name = seq.get("name", f"Sequence {i+1}")
+        ctk.CTkLabel(row, text=name, anchor="w").pack(side="left", fill="x", expand=True)
 
-        delay = action.get("delay", 0)
-        ctk.CTkLabel(row, text=f"{delay}ms", width=55, text_color="gray").pack(
-            side="left", padx=3)
-
-        bind_dblclick(row)
+        n = len(seq.get("actions", []))
+        ctk.CTkLabel(row, text=f"{n} action{'s' if n != 1 else ''}",
+                      width=72, text_color="gray", font=("", 11)).pack(side="left")
 
         ctk.CTkButton(
             row, text="\u25b6", width=28, height=28,
             fg_color="#2d6a8a", hover_color="#3a85ad",
-            command=lambda a=action: self._run_single_action(a),
+            command=lambda s=seq: self._run_single_sequence(s),
         ).pack(side="left", padx=1)
 
-        hk = action.get("hotkey", "")
+        ctk.CTkButton(
+            row, text="Edit", width=46, height=28,
+            command=lambda idx=i: self._open_seq_editor(idx),
+        ).pack(side="left", padx=1)
+
+        hk = seq.get("hotkey", "")
         ctk.CTkButton(
             row, text=hk if hk else "+", width=46, height=28,
             fg_color="#2d5a2d" if hk else "#3a3a3a",
             hover_color="#3a7a3a" if hk else "#4a4a4a",
             font=("", 11),
-            command=lambda idx=i: self._record_action_hotkey(idx),
+            command=lambda idx=i: self._record_seq_hotkey(idx),
         ).pack(side="left", padx=1)
 
         if i > 0:
-            ctk.CTkButton(
-                row, text="\u25b2", width=28, height=28,
-                command=lambda idx=i: self._move_action(idx, -1),
-            ).pack(side="left", padx=1)
-        if i < len(self.actions) - 1:
-            ctk.CTkButton(
-                row, text="\u25bc", width=28, height=28,
-                command=lambda idx=i: self._move_action(idx, 1),
-            ).pack(side="left", padx=1)
-        ctk.CTkButton(
-            row, text="\u2715", width=28, height=28,
-            fg_color="#aa3333", hover_color="#cc4444",
-            command=lambda idx=i: self._delete_action(idx),
-        ).pack(side="left", padx=(1, 5))
+            ctk.CTkButton(row, text="\u25b2", width=28, height=28,
+                           command=lambda idx=i: self._move_sequence(idx, -1)).pack(
+                side="left", padx=1)
+        if i < len(self.sequences) - 1:
+            ctk.CTkButton(row, text="\u25bc", width=28, height=28,
+                           command=lambda idx=i: self._move_sequence(idx, 1)).pack(
+                side="left", padx=1)
 
-    def _append_action_row(self, action: dict):
-        """Add one row for the last action in self.actions without rebuilding the list."""
-        i = len(self.actions) - 1
+        ctk.CTkButton(row, text="\u2715", width=28, height=28,
+                       fg_color="#aa3333", hover_color="#cc4444",
+                       command=lambda idx=i: self._delete_sequence(idx)).pack(
+            side="left", padx=(1, 5))
 
-        # Remove the placeholder label if present
-        if self._actions_placeholder is not None:
-            self._actions_placeholder.destroy()
-            self._actions_placeholder = None
+    def _append_seq_row(self, seq: dict):
+        i = len(self.sequences) - 1
+        if self._seq_placeholder is not None:
+            self._seq_placeholder.destroy()
+            self._seq_placeholder = None
+        hk = seq.get("hotkey", "")
+        hid = self.seq_hotkey_mgr.register(hk, lambda s=seq: self._run_single_sequence(s)) if hk else -1
+        self._seq_hids.append(hid)
+        self._build_seq_row(i, seq)
 
-        # Register hotkey for this action if it has one
-        hk = action.get("hotkey", "")
-        if hk:
-            hid = self.action_hotkey_mgr.register(hk, lambda a=action: self._run_single_action(a))
-        else:
-            hid = -1
-        self._action_hids.append(hid)
+    def _add_sequence(self):
+        idx = len(self.sequences)
+        new_seq = {"name": f"Sequence {idx + 1}", "hotkey": "", "repeat": 1,
+                   "delay": 0, "actions": []}
+        self.sequences.append(new_seq)
+        self._append_seq_row(new_seq)
+        self._open_seq_editor(idx)
 
-        self._build_action_row(i, action)
+    def _delete_sequence(self, index: int):
+        self.sequences.pop(index)
+        self._refresh_seq_list()
 
-    def _refresh_action_list(self):
-        for w in self.action_frame.winfo_children():
-            w.destroy()
-        self._actions_placeholder = None
-
-        self._rebuild_action_hotkeys()
-
-        if not self.actions:
-            self._actions_placeholder = ctk.CTkLabel(
-                self.action_frame, text="No actions yet. Add some above.", text_color="gray"
-            )
-            self._actions_placeholder.pack(pady=20)
-            return
-
-        for i, action in enumerate(self.actions):
-            self._build_action_row(i, action)
-
-    @staticmethod
-    def _describe_action(action: dict) -> str:
-        atype = action.get("type")
-        r = action.get("repeat", 1)
-        suffix = f"  ×{r}" if r > 1 else ""
-        if atype == "key":
-            return f"Key: {action['key'].upper()}  ({action.get('action', 'tap')}){suffix}"
-        elif atype == "combo":
-            return f"Combo: {combo_display(action.get('keys', []))}{suffix}"
-        elif atype == "click":
-            return f"Click: ({action['x']}, {action['y']})  {action.get('button', 'left')}{suffix}"
-        elif atype == "delay":
-            return f"Delay: {action.get('delay', 0)} ms{suffix}"
-        elif atype == "type_string":
-            text = action.get("text", "")
-            preview = text[:28] + ("..." if len(text) > 28 else "")
-            return f'Text: "{preview}"{suffix}'
-        return "Unknown"
-
-    def _move_action(self, index: int, direction: int):
+    def _move_sequence(self, index: int, direction: int):
         new_idx = index + direction
-        if 0 <= new_idx < len(self.actions):
-            self.actions[index], self.actions[new_idx] = (
-                self.actions[new_idx], self.actions[index]
-            )
-            self._refresh_action_list()
+        if 0 <= new_idx < len(self.sequences):
+            self.sequences[index], self.sequences[new_idx] = (
+                self.sequences[new_idx], self.sequences[index])
+            self._refresh_seq_list()
 
-    def _delete_action(self, index: int):
-        self.actions.pop(index)
-        self._refresh_action_list()
+    def _run_single_sequence(self, seq: dict):
+        MacroEngine().start([seq], 1)
 
-    def _clear_actions(self):
-        self.actions.clear()
-        self._refresh_action_list()
-
-    def _default_delay(self) -> int:
-        try:
-            return max(0, int(self.default_delay_var.get()))
-        except (ValueError, AttributeError):
-            return 10
-
-    # ── Single-action trigger ────────────────────────────────────────────
-
-    def _run_single_action(self, action: dict):
-        MacroEngine().start([action], 1)
-
-    # ── Per-action hotkeys ───────────────────────────────────────────────
-
-    def _rebuild_action_hotkeys(self):
-        self.action_hotkey_mgr.unregister_all()
-        self._action_hids = []
-        for action in self.actions:
-            hk = action.get("hotkey", "")
+    def _rebuild_seq_hotkeys(self):
+        self.seq_hotkey_mgr.unregister_all()
+        self._seq_hids = []
+        for seq in self.sequences:
+            hk = seq.get("hotkey", "")
             if hk:
-                hid = self.action_hotkey_mgr.register(
-                    hk, lambda a=action: self._run_single_action(a)
-                )
-                self._action_hids.append(hid)
+                hid = self.seq_hotkey_mgr.register(
+                    hk, lambda s=seq: self._run_single_sequence(s))
+                self._seq_hids.append(hid)
             else:
-                self._action_hids.append(-1)
+                self._seq_hids.append(-1)
 
-    def _record_action_hotkey(self, index: int):
-        action = self.actions[index]
-        current = action.get("hotkey", "")
+    def _record_seq_hotkey(self, index: int):
+        seq = self.sequences[index]
+        current = seq.get("hotkey", "")
 
         dlg = ctk.CTkToplevel(self)
-        dlg.title("Action Hotkey")
+        dlg.title("Sequence Hotkey")
         dlg.resizable(False, False)
         dlg.transient(self)
         dlg.grab_set()
 
-        ctk.CTkLabel(dlg, text="Press a key to assign, or clear:", font=("", 12)).pack(pady=(18, 6))
+        ctk.CTkLabel(dlg, text="Press a key to assign, or clear:", font=("", 12)).pack(
+            pady=(18, 6))
         display_var = ctk.StringVar(value=current if current else "— none —")
         ctk.CTkLabel(dlg, textvariable=display_var, font=("", 14, "bold")).pack(pady=4)
 
@@ -1146,27 +1085,167 @@ class AutoMacroApp(ctk.CTk):
         btn_row = ctk.CTkFrame(dlg, fg_color="transparent")
         btn_row.pack(pady=10)
 
-        capture_btn = ctk.CTkButton(btn_row, text="Record Key", width=110, command=start_capture)
+        capture_btn = ctk.CTkButton(btn_row, text="Record Key", width=110,
+                                     command=start_capture)
         capture_btn.pack(side="left", padx=4)
 
         def save():
-            self.actions[index]["hotkey"] = captured["key"]
-            self._refresh_action_list()
+            seq["hotkey"] = captured["key"]
+            self._refresh_seq_list()
             dlg.destroy()
 
         def clear():
-            self.actions[index].pop("hotkey", None)
-            self._refresh_action_list()
+            seq.pop("hotkey", None)
+            self._refresh_seq_list()
             dlg.destroy()
 
         ctk.CTkButton(btn_row, text="Save", width=70, command=save).pack(side="left", padx=4)
         ctk.CTkButton(btn_row, text="Clear", width=60, fg_color="#aa3333",
                        hover_color="#cc4444", command=clear).pack(side="left", padx=4)
 
-    # ── Dialogs ──────────────────────────────────────────────────────────
+    # ── Sequence Editor ──────────────────────────────────────────────────
+
+    def _open_seq_editor(self, index: int):
+        self._editing_seq_index = index
+        seq = self.sequences[index]
+        self.seq_name_var.set(seq.get("name", f"Sequence {index + 1}"))
+        self.seq_repeat_var.set(str(seq.get("repeat", 1)))
+        self.seq_delay_var.set(str(seq.get("delay", 0)))
+        self._show_seq_edit_panel()
+        self._refresh_action_list()
+
+    def _back_to_seq_list(self):
+        if self._editing_seq_index is not None:
+            self._save_seq_edits()
+        self._editing_seq_index = None
+        self._show_seq_list_panel()
+        self._refresh_seq_list()
+
+    def _save_seq_edits(self):
+        idx = self._editing_seq_index
+        if idx is None or idx >= len(self.sequences):
+            return
+        self.sequences[idx]["name"] = self.seq_name_var.get().strip() or f"Sequence {idx + 1}"
+        try:
+            self.sequences[idx]["repeat"] = max(1, int(self.seq_repeat_var.get()))
+        except ValueError:
+            self.sequences[idx]["repeat"] = 1
+        try:
+            self.sequences[idx]["delay"] = max(0, int(self.seq_delay_var.get()))
+        except ValueError:
+            self.sequences[idx]["delay"] = 0
+
+    @property
+    def _current_actions(self) -> list[dict]:
+        if self._editing_seq_index is not None and self._editing_seq_index < len(self.sequences):
+            return self.sequences[self._editing_seq_index]["actions"]
+        return []
+
+    # ── Action List (inside sequence editor) ─────────────────────────────
+
+    def _build_action_row(self, i: int, action: dict):
+        row = ctk.CTkFrame(self.action_frame)
+        row.pack(fill="x", pady=2, padx=2)
+
+        def bind_dblclick(widget, idx=i):
+            widget.bind("<Double-Button-1>", lambda e, j=idx: self._edit_action(j))
+            for child in widget.winfo_children():
+                bind_dblclick(child, idx)
+
+        ctk.CTkLabel(row, text=f"#{i+1}", width=30, font=("", 12, "bold")).pack(
+            side="left", padx=(5, 3))
+
+        desc = self._describe_action(action)
+        ctk.CTkLabel(row, text=desc, anchor="w").pack(side="left", fill="x", expand=True)
+
+        delay = action.get("delay", 0)
+        ctk.CTkLabel(row, text=f"{delay}ms", width=55, text_color="gray").pack(
+            side="left", padx=3)
+
+        bind_dblclick(row)
+
+        if i > 0:
+            ctk.CTkButton(row, text="\u25b2", width=28, height=28,
+                           command=lambda idx=i: self._move_action(idx, -1)).pack(
+                side="left", padx=1)
+        if i < len(self._current_actions) - 1:
+            ctk.CTkButton(row, text="\u25bc", width=28, height=28,
+                           command=lambda idx=i: self._move_action(idx, 1)).pack(
+                side="left", padx=1)
+
+        ctk.CTkButton(row, text="\u2715", width=28, height=28,
+                       fg_color="#aa3333", hover_color="#cc4444",
+                       command=lambda idx=i: self._delete_action(idx)).pack(
+            side="left", padx=(1, 5))
+
+    def _append_action_row(self, action: dict):
+        i = len(self._current_actions) - 1
+        if self._actions_placeholder is not None:
+            self._actions_placeholder.destroy()
+            self._actions_placeholder = None
+        self._build_action_row(i, action)
+
+    def _refresh_action_list(self):
+        for w in self.action_frame.winfo_children():
+            w.destroy()
+        self._actions_placeholder = None
+
+        actions = self._current_actions
+        if not actions:
+            self._actions_placeholder = ctk.CTkLabel(
+                self.action_frame,
+                text="No actions yet. Add some below.",
+                text_color="gray",
+            )
+            self._actions_placeholder.pack(pady=20)
+            return
+
+        for i, action in enumerate(actions):
+            self._build_action_row(i, action)
+
+    @staticmethod
+    def _describe_action(action: dict) -> str:
+        atype = action.get("type")
+        r = action.get("repeat", 1)
+        suffix = f"  \u00d7{r}" if r > 1 else ""
+        if atype == "key":
+            return f"Key: {action['key'].upper()}  ({action.get('action', 'tap')}){suffix}"
+        elif atype == "combo":
+            return f"Combo: {combo_display(action.get('keys', []))}{suffix}"
+        elif atype == "click":
+            return f"Click: ({action['x']}, {action['y']})  {action.get('button', 'left')}{suffix}"
+        elif atype == "delay":
+            return f"Delay: {action.get('delay', 0)} ms{suffix}"
+        elif atype == "type_string":
+            text = action.get("text", "")
+            preview = text[:28] + ("..." if len(text) > 28 else "")
+            return f'Text: "{preview}"{suffix}'
+        return "Unknown"
+
+    def _move_action(self, index: int, direction: int):
+        actions = self._current_actions
+        new_idx = index + direction
+        if 0 <= new_idx < len(actions):
+            actions[index], actions[new_idx] = actions[new_idx], actions[index]
+            self._refresh_action_list()
+
+    def _delete_action(self, index: int):
+        self._current_actions.pop(index)
+        self._refresh_action_list()
+
+    def _clear_actions(self):
+        if self._editing_seq_index is not None and self._editing_seq_index < len(self.sequences):
+            self.sequences[self._editing_seq_index]["actions"].clear()
+        self._refresh_action_list()
+
+    def _default_delay(self) -> int:
+        try:
+            return max(0, int(self.default_delay_var.get()))
+        except (ValueError, AttributeError):
+            return 10
 
     def _edit_action(self, index: int):
-        atype = self.actions[index].get("type")
+        atype = self._current_actions[index].get("type")
         dispatch = {
             "key": self._dlg_add_key,
             "combo": self._dlg_add_combo,
@@ -1178,12 +1257,12 @@ class AutoMacroApp(ctk.CTk):
         if fn:
             fn(edit_index=index)
 
+    # ── Action Dialogs ───────────────────────────────────────────────────
+
     def _dlg_add_combo(self, edit_index: int | None = None):
         editing = edit_index is not None
-        existing = self.actions[edit_index] if editing else {}
+        existing = self._current_actions[edit_index] if editing else {}
         ex_keys: list[str] = existing.get("keys", [])
-
-        # Parse existing keys into modifiers + main key
         ex_mods = {k.upper() for k in ex_keys if k.upper() in _MODIFIER_NAMES}
         ex_main = next((k for k in ex_keys if k.upper() not in _MODIFIER_NAMES), "A")
 
@@ -1194,7 +1273,6 @@ class AutoMacroApp(ctk.CTk):
         dlg.grab_set()
 
         ctk.CTkLabel(dlg, text="Modifiers:", anchor="w").pack(fill="x", padx=20, pady=(14, 4))
-
         mod_frame = ctk.CTkFrame(dlg, fg_color="transparent")
         mod_frame.pack(fill="x", padx=20)
 
@@ -1210,7 +1288,6 @@ class AutoMacroApp(ctk.CTk):
         main_var = ctk.StringVar(value=ex_main)
         ctk.CTkComboBox(dlg, values=ALL_KEY_NAMES, variable=main_var, width=280).pack(padx=20)
 
-        # Live preview
         preview_var = ctk.StringVar()
 
         def update_preview(*_):
@@ -1260,12 +1337,10 @@ class AutoMacroApp(ctk.CTk):
                 repeat = 1
             new_action = {"type": "combo", "keys": keys, "delay": max(0, delay), "repeat": repeat}
             if editing:
-                if existing.get("hotkey"):
-                    new_action["hotkey"] = existing["hotkey"]
-                self.actions[edit_index] = new_action
+                self._current_actions[edit_index] = new_action
                 self._refresh_action_list()
             else:
-                self.actions.append(new_action)
+                self._current_actions.append(new_action)
                 self._append_action_row(new_action)
             dlg.destroy()
 
@@ -1273,7 +1348,7 @@ class AutoMacroApp(ctk.CTk):
 
     def _dlg_add_key(self, edit_index: int | None = None):
         editing = edit_index is not None
-        existing = self.actions[edit_index] if editing else {}
+        existing = self._current_actions[edit_index] if editing else {}
 
         dlg = ctk.CTkToplevel(self)
         dlg.title("Edit Key Press" if editing else "Add Key Press")
@@ -1283,7 +1358,6 @@ class AutoMacroApp(ctk.CTk):
 
         captured = {"key": existing.get("key", "")}
 
-        # Key capture area
         ctk.CTkLabel(dlg, text="Key:").pack(pady=(15, 0))
         key_display = ctk.CTkLabel(
             dlg, text=captured["key"] if captured["key"] else "— none —",
@@ -1341,13 +1415,11 @@ class AutoMacroApp(ctk.CTk):
                 "type": "key", "key": captured["key"],
                 "action": action_var.get(), "delay": max(0, delay), "repeat": repeat,
             }
-            if editing and existing.get("hotkey"):
-                new_action["hotkey"] = existing["hotkey"]
             if editing:
-                self.actions[edit_index] = new_action
+                self._current_actions[edit_index] = new_action
                 self._refresh_action_list()
             else:
-                self.actions.append(new_action)
+                self._current_actions.append(new_action)
                 self._append_action_row(new_action)
             dlg.destroy()
 
@@ -1355,7 +1427,7 @@ class AutoMacroApp(ctk.CTk):
 
     def _dlg_add_click(self, edit_index: int | None = None):
         editing = edit_index is not None
-        existing = self.actions[edit_index] if editing else {}
+        existing = self._current_actions[edit_index] if editing else {}
 
         dlg = ctk.CTkToplevel(self)
         dlg.title("Edit Mouse Click" if editing else "Add Mouse Click")
@@ -1420,13 +1492,11 @@ class AutoMacroApp(ctk.CTk):
                 "type": "click", "x": x, "y": y,
                 "button": btn_var.get(), "delay": max(0, delay), "repeat": repeat,
             }
-            if editing and existing.get("hotkey"):
-                new_action["hotkey"] = existing["hotkey"]
             if editing:
-                self.actions[edit_index] = new_action
+                self._current_actions[edit_index] = new_action
                 self._refresh_action_list()
             else:
-                self.actions.append(new_action)
+                self._current_actions.append(new_action)
                 self._append_action_row(new_action)
             dlg.destroy()
 
@@ -1434,7 +1504,7 @@ class AutoMacroApp(ctk.CTk):
 
     def _dlg_add_delay(self, edit_index: int | None = None):
         editing = edit_index is not None
-        existing = self.actions[edit_index] if editing else {}
+        existing = self._current_actions[edit_index] if editing else {}
 
         dlg = ctk.CTkToplevel(self)
         dlg.title("Edit Delay" if editing else "Add Delay")
@@ -1460,13 +1530,11 @@ class AutoMacroApp(ctk.CTk):
             except ValueError:
                 repeat = 1
             new_action = {"type": "delay", "delay": max(0, delay), "repeat": repeat}
-            if editing and existing.get("hotkey"):
-                new_action["hotkey"] = existing["hotkey"]
             if editing:
-                self.actions[edit_index] = new_action
+                self._current_actions[edit_index] = new_action
                 self._refresh_action_list()
             else:
-                self.actions.append(new_action)
+                self._current_actions.append(new_action)
                 self._append_action_row(new_action)
             dlg.destroy()
 
@@ -1474,7 +1542,7 @@ class AutoMacroApp(ctk.CTk):
 
     def _dlg_add_string(self, edit_index: int | None = None):
         editing = edit_index is not None
-        existing = self.actions[edit_index] if editing else {}
+        existing = self._current_actions[edit_index] if editing else {}
 
         dlg = ctk.CTkToplevel(self)
         dlg.title("Edit Text" if editing else "Add Text")
@@ -1505,29 +1573,19 @@ class AutoMacroApp(ctk.CTk):
                 repeat = max(1, int(repeat_var.get()))
             except ValueError:
                 repeat = 1
-            new_action = {"type": "type_string", "text": text, "delay": max(0, delay), "repeat": repeat}
-            if editing and existing.get("hotkey"):
-                new_action["hotkey"] = existing["hotkey"]
+            new_action = {"type": "type_string", "text": text,
+                          "delay": max(0, delay), "repeat": repeat}
             if editing:
-                self.actions[edit_index] = new_action
+                self._current_actions[edit_index] = new_action
                 self._refresh_action_list()
             else:
-                self.actions.append(new_action)
+                self._current_actions.append(new_action)
                 self._append_action_row(new_action)
             dlg.destroy()
 
         ctk.CTkButton(dlg, text="Save" if editing else "Add", command=submit).pack(pady=8)
 
-    # ── Controls ─────────────────────────────────────────────────────────
-
-    def _toggle_macro(self):
-        if self.engine.running:
-            self.engine.stop()
-        else:
-            if not self.actions:
-                return
-            repeat = 0 if self.infinite_var.get() else int(self.repeat_var.get() or 1)
-            self.engine.start(list(self.actions), repeat)
+    # ── Input Recording ──────────────────────────────────────────────────
 
     def _toggle_input_recording(self):
         if self._input_recording:
@@ -1541,7 +1599,6 @@ class AutoMacroApp(ctk.CTk):
         self.record_input_btn.configure(
             text="Stop Recording (F8)", fg_color="#c0392b", hover_color="#e74c3c"
         )
-        self._update_status("recording inputs — press F8 to stop")
 
     def _stop_input_recording(self):
         self._input_recording = False
@@ -1549,7 +1606,6 @@ class AutoMacroApp(ctk.CTk):
         self.record_input_btn.configure(
             text="Record Inputs (F8)", fg_color="#7b3fa0", hover_color="#9b52c4"
         )
-        self._update_status("Stopped")
 
     def _on_recorded_action(self, action: dict):
         self.after(0, self._append_recorded_action, action)
@@ -1558,13 +1614,127 @@ class AutoMacroApp(ctk.CTk):
         if action.get("type") == "key" and action.get("key", "").upper() == "F8":
             self._stop_input_recording()
             return
-        self.actions.append(action)
+        if self._editing_seq_index is None:
+            return
+        self._current_actions.append(action)
         self._append_action_row(action)
+
+    # ── Presets ──────────────────────────────────────────────────────────
+
+    def _build_presets_tab(self, parent):
+        header = ctk.CTkFrame(parent, fg_color="transparent")
+        header.pack(fill="x", padx=10, pady=(12, 8))
+        ctk.CTkLabel(header, text="Presets", font=("", 15, "bold")).pack(side="left")
+        ctk.CTkButton(header, text="Save Current", width=120,
+                       command=self._save_preset).pack(side="right")
+
+        self.preset_frame = ctk.CTkScrollableFrame(parent)
+        self.preset_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+    def _refresh_presets(self):
+        for w in self.preset_frame.winfo_children():
+            w.destroy()
+        files = sorted(self.PRESETS_DIR.glob("*.json"))
+        if not files:
+            ctk.CTkLabel(self.preset_frame, text="No presets saved yet.",
+                          text_color="gray").pack(pady=20)
+            return
+        for path in files:
+            row = ctk.CTkFrame(self.preset_frame)
+            row.pack(fill="x", pady=3, padx=2)
+            ctk.CTkLabel(row, text=path.stem, anchor="w", font=("", 13)).pack(
+                side="left", fill="x", expand=True, padx=10)
+            ctk.CTkButton(row, text="Load", width=70,
+                           command=lambda p=path: self._load_preset_file(p)).pack(
+                side="left", padx=4)
+            ctk.CTkButton(row, text="\u2715", width=32, height=28,
+                           fg_color="#aa3333", hover_color="#cc4444",
+                           command=lambda p=path: self._delete_preset(p)).pack(
+                side="left", padx=(0, 6))
+
+    def _save_preset(self):
+        name = self.name_var.get().strip() or "Untitled"
+        safe = "".join(c if c.isalnum() or c in " _-" else "_" for c in name)
+        path = self.PRESETS_DIR / f"{safe}.json"
+        repeat = 0 if self.infinite_var.get() else int(self.repeat_var.get() or 1)
+        data = {
+            "name": name,
+            "hotkey": self.hotkey,
+            "hotkey_enabled": self.hotkey_enabled_var.get(),
+            "repeat": repeat,
+            "sequences": self.sequences,
+        }
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        self._switch_tab("presets")
+
+    def _load_preset_file(self, path: Path):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        self._apply_macro_data(data)
+        self._switch_tab("sequences")
+
+    def _delete_preset(self, path: Path):
+        path.unlink(missing_ok=True)
+        self._refresh_presets()
+
+    def _apply_macro_data(self, data: dict):
+        self._editing_seq_index = None
+        self._show_seq_list_panel()
+
+        # Support old format (flat actions list) by wrapping in a single sequence
+        if "actions" in data and "sequences" not in data:
+            self.sequences = [{
+                "name": "Sequence 1", "hotkey": "", "repeat": 1, "delay": 0,
+                "actions": data["actions"],
+            }]
+        else:
+            self.sequences = data.get("sequences", [])
+
+        name = data.get("name", "Untitled")
+        hotkey = data.get("hotkey", "F6")
+        repeat = data.get("repeat", 1)
+        hotkey_enabled = data.get("hotkey_enabled", True)
+
+        self.macro_name = name
+        self.name_var.set(name)
+        self.hotkey = hotkey
+        self.hotkey_label.configure(text=hotkey)
+        self.start_btn.configure(text=f"Start ({hotkey})")
+        self.hotkey_enabled_var.set(hotkey_enabled)
+        self._apply_hotkey_enabled()
+
+        if repeat == 0:
+            self.infinite_var.set(True)
+        else:
+            self.infinite_var.set(False)
+            self.repeat_var.set(str(repeat))
+        self._on_infinite_toggle()
+
+        self._refresh_seq_list()
+
+    # ── Controls ─────────────────────────────────────────────────────────
+
+    def _toggle_macro(self):
+        if self.engine.running:
+            self.engine.stop()
+        else:
+            if not self.sequences:
+                return
+            repeat = 0 if self.infinite_var.get() else int(self.repeat_var.get() or 1)
+            self.engine.start(list(self.sequences), repeat)
 
     def _on_infinite_toggle(self):
         self.repeat_entry.configure(
             state="disabled" if self.infinite_var.get() else "normal"
         )
+
+    def _on_hotkey_toggle(self):
+        self._apply_hotkey_enabled()
+
+    def _apply_hotkey_enabled(self):
+        if self.hotkey_enabled_var.get():
+            self.hotkey_mgr.set_hotkey(self.hotkey)
+        else:
+            self.hotkey_mgr.stop()
 
     def _start_hotkey_recording(self):
         self._recording_hotkey = True
@@ -1589,7 +1759,8 @@ class AutoMacroApp(ctk.CTk):
         self.hotkey_label.configure(text=name)
         self.record_hotkey_btn.configure(text="Record", state="normal")
         self.start_btn.configure(text=f"Start ({name})")
-        self.hotkey_mgr.set_hotkey(name)
+        if self.hotkey_enabled_var.get():
+            self.hotkey_mgr.set_hotkey(name)
 
     def _on_engine_status(self, status: str):
         self.after(0, self._update_status, status)
@@ -1715,7 +1886,7 @@ class AutoMacroApp(ctk.CTk):
         self.engine.stop()
         self.hotkey_mgr.stop()
         self.recorder.stop()
-        self.action_hotkey_mgr.stop()
+        self.seq_hotkey_mgr.stop()
         if hasattr(self, "_overlay"):
             self._overlay.destroy()
         self.destroy()

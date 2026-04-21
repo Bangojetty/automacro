@@ -457,12 +457,16 @@ class MacroEngine:
                 for action in actions:
                     if self._stop_event.is_set():
                         break
-                    self._execute_action(action)
-                    if self._on_action:
-                        self._on_action()
-                    delay_ms = action.get("delay", 0)
-                    if delay_ms > 0:
-                        self._interruptible_sleep(delay_ms / 1000.0)
+                    action_repeat = max(1, action.get("repeat", 1))
+                    for _ in range(action_repeat):
+                        if self._stop_event.is_set():
+                            break
+                        self._execute_action(action)
+                        if self._on_action:
+                            self._on_action()
+                        delay_ms = action.get("delay", 0)
+                        if delay_ms > 0:
+                            self._interruptible_sleep(delay_ms / 1000.0)
 
                 if repeat != 0 and iteration >= repeat:
                     break
@@ -936,18 +940,20 @@ class AutoMacroApp(ctk.CTk):
     @staticmethod
     def _describe_action(action: dict) -> str:
         atype = action.get("type")
+        r = action.get("repeat", 1)
+        suffix = f"  ×{r}" if r > 1 else ""
         if atype == "key":
-            return f"Key: {action['key'].upper()}  ({action.get('action', 'tap')})"
+            return f"Key: {action['key'].upper()}  ({action.get('action', 'tap')}){suffix}"
         elif atype == "combo":
-            return f"Combo: {combo_display(action.get('keys', []))}"
+            return f"Combo: {combo_display(action.get('keys', []))}{suffix}"
         elif atype == "click":
-            return f"Click: ({action['x']}, {action['y']})  {action.get('button', 'left')}"
+            return f"Click: ({action['x']}, {action['y']})  {action.get('button', 'left')}{suffix}"
         elif atype == "delay":
-            return f"Delay: {action.get('delay', 0)} ms"
+            return f"Delay: {action.get('delay', 0)} ms{suffix}"
         elif atype == "type_string":
             text = action.get("text", "")
             preview = text[:28] + ("..." if len(text) > 28 else "")
-            return f'Text: "{preview}"'
+            return f'Text: "{preview}"{suffix}'
         return "Unknown"
 
     def _move_action(self, index: int, direction: int):
@@ -1110,6 +1116,10 @@ class AutoMacroApp(ctk.CTk):
         ctk.CTkLabel(dlg, textvariable=preview_var, font=("", 14, "bold"),
                       text_color="#4ade80").pack(pady=8)
 
+        ctk.CTkLabel(dlg, text="Repeat:", anchor="w").pack(fill="x", padx=20)
+        repeat_var = ctk.StringVar(value=str(existing.get("repeat", 1)))
+        ctk.CTkEntry(dlg, textvariable=repeat_var, width=280).pack(padx=20, pady=4)
+
         ctk.CTkLabel(dlg, text="Delay after (ms):", anchor="w").pack(fill="x", padx=20)
         delay_var = ctk.StringVar(value=str(existing.get("delay", 50)))
         ctk.CTkEntry(dlg, textvariable=delay_var, width=280).pack(padx=20, pady=4)
@@ -1127,7 +1137,11 @@ class AutoMacroApp(ctk.CTk):
                 delay = int(delay_var.get())
             except ValueError:
                 delay = 50
-            new_action = {"type": "combo", "keys": keys, "delay": max(0, delay)}
+            try:
+                repeat = max(1, int(repeat_var.get()))
+            except ValueError:
+                repeat = 1
+            new_action = {"type": "combo", "keys": keys, "delay": max(0, delay), "repeat": repeat}
             if editing:
                 if existing.get("hotkey"):
                     new_action["hotkey"] = existing["hotkey"]
@@ -1145,32 +1159,70 @@ class AutoMacroApp(ctk.CTk):
 
         dlg = ctk.CTkToplevel(self)
         dlg.title("Edit Key Press" if editing else "Add Key Press")
-        dlg.geometry("320x310")
+        dlg.geometry("320x340")
         dlg.resizable(False, False)
         dlg.transient(self)
         dlg.grab_set()
 
+        captured = {"key": existing.get("key", "")}
+
+        # Key capture area
         ctk.CTkLabel(dlg, text="Key:").pack(pady=(15, 0))
-        key_var = ctk.StringVar(value=existing.get("key", "A"))
-        ctk.CTkComboBox(dlg, values=ALL_KEY_NAMES, variable=key_var, width=200).pack(pady=5)
+        key_display = ctk.CTkLabel(
+            dlg, text=captured["key"] if captured["key"] else "— none —",
+            font=("", 14, "bold"), width=200,
+        )
+        key_display.pack(pady=(4, 2))
+
+        record_btn = ctk.CTkButton(dlg, text="Press a Key to Record", width=200)
+        record_btn.pack(pady=(0, 8))
+
+        def start_key_capture():
+            record_btn.configure(text="Listening...", state="disabled")
+            key_display.configure(text="Press any key...")
+
+            def poll():
+                time.sleep(0.15)
+                for name, vk in VK_MAP.items():
+                    if user32.GetAsyncKeyState(vk) & 0x8000:
+                        captured["key"] = name
+                        dlg.after(0, lambda n=name: key_display.configure(text=n))
+                        dlg.after(0, lambda: record_btn.configure(
+                            text="Press a Key to Record", state="normal"))
+                        return
+                threading.Thread(target=poll, daemon=True).start()
+
+            threading.Thread(target=poll, daemon=True).start()
+
+        record_btn.configure(command=start_key_capture)
 
         ctk.CTkLabel(dlg, text="Action:").pack()
         action_var = ctk.StringVar(value=existing.get("action", "tap"))
         ctk.CTkComboBox(dlg, values=["tap", "press", "release"],
                          variable=action_var, width=200).pack(pady=5)
 
+        ctk.CTkLabel(dlg, text="Repeat:").pack()
+        repeat_var = ctk.StringVar(value=str(existing.get("repeat", 1)))
+        ctk.CTkEntry(dlg, textvariable=repeat_var, width=200).pack(pady=5)
+
         ctk.CTkLabel(dlg, text="Delay after (ms):").pack()
         delay_var = ctk.StringVar(value=str(existing.get("delay", 100)))
         ctk.CTkEntry(dlg, textvariable=delay_var, width=200).pack(pady=5)
 
         def submit():
+            if not captured["key"]:
+                return
             try:
                 delay = int(delay_var.get())
             except ValueError:
                 delay = 100
+            try:
+                repeat = max(1, int(repeat_var.get()))
+            except ValueError:
+                repeat = 1
             new_action = {
-                "type": "key", "key": key_var.get(),
-                "action": action_var.get(), "delay": max(0, delay),
+                "type": "key", "key": captured["key"],
+                "action": action_var.get(), "delay": max(0, delay), "repeat": repeat,
             }
             if editing and existing.get("hotkey"):
                 new_action["hotkey"] = existing["hotkey"]
@@ -1229,6 +1281,10 @@ class AutoMacroApp(ctk.CTk):
         ctk.CTkComboBox(dlg, values=["left", "right", "middle"],
                          variable=btn_var, width=200).pack(pady=5)
 
+        ctk.CTkLabel(dlg, text="Repeat:").pack()
+        repeat_var = ctk.StringVar(value=str(existing.get("repeat", 1)))
+        ctk.CTkEntry(dlg, textvariable=repeat_var, width=200).pack(pady=5)
+
         ctk.CTkLabel(dlg, text="Delay after (ms):").pack()
         delay_var = ctk.StringVar(value=str(existing.get("delay", 200)))
         ctk.CTkEntry(dlg, textvariable=delay_var, width=200).pack(pady=5)
@@ -1239,9 +1295,13 @@ class AutoMacroApp(ctk.CTk):
                 delay = int(delay_var.get())
             except ValueError:
                 x, y, delay = 0, 0, 200
+            try:
+                repeat = max(1, int(repeat_var.get()))
+            except ValueError:
+                repeat = 1
             new_action = {
                 "type": "click", "x": x, "y": y,
-                "button": btn_var.get(), "delay": max(0, delay),
+                "button": btn_var.get(), "delay": max(0, delay), "repeat": repeat,
             }
             if editing and existing.get("hotkey"):
                 new_action["hotkey"] = existing["hotkey"]
@@ -1265,7 +1325,11 @@ class AutoMacroApp(ctk.CTk):
         dlg.transient(self)
         dlg.grab_set()
 
-        ctk.CTkLabel(dlg, text="Delay (ms):").pack(pady=(20, 0))
+        ctk.CTkLabel(dlg, text="Repeat:").pack(pady=(20, 0))
+        repeat_var = ctk.StringVar(value=str(existing.get("repeat", 1)))
+        ctk.CTkEntry(dlg, textvariable=repeat_var, width=200).pack(pady=5)
+
+        ctk.CTkLabel(dlg, text="Delay (ms):").pack()
         delay_var = ctk.StringVar(value=str(existing.get("delay", 500)))
         ctk.CTkEntry(dlg, textvariable=delay_var, width=200).pack(pady=5)
 
@@ -1274,7 +1338,11 @@ class AutoMacroApp(ctk.CTk):
                 delay = int(delay_var.get())
             except ValueError:
                 delay = 500
-            new_action = {"type": "delay", "delay": max(0, delay)}
+            try:
+                repeat = max(1, int(repeat_var.get()))
+            except ValueError:
+                repeat = 1
+            new_action = {"type": "delay", "delay": max(0, delay), "repeat": repeat}
             if editing and existing.get("hotkey"):
                 new_action["hotkey"] = existing["hotkey"]
             if editing:
@@ -1302,6 +1370,10 @@ class AutoMacroApp(ctk.CTk):
         text_box.pack(pady=5, padx=20)
         text_box.insert("0.0", existing.get("text", ""))
 
+        ctk.CTkLabel(dlg, text="Repeat:").pack()
+        repeat_var = ctk.StringVar(value=str(existing.get("repeat", 1)))
+        ctk.CTkEntry(dlg, textvariable=repeat_var, width=200).pack(pady=5)
+
         ctk.CTkLabel(dlg, text="Delay after (ms):").pack()
         delay_var = ctk.StringVar(value=str(existing.get("delay", 0)))
         ctk.CTkEntry(dlg, textvariable=delay_var, width=200).pack(pady=5)
@@ -1312,7 +1384,11 @@ class AutoMacroApp(ctk.CTk):
                 delay = int(delay_var.get())
             except ValueError:
                 delay = 0
-            new_action = {"type": "type_string", "text": text, "delay": max(0, delay)}
+            try:
+                repeat = max(1, int(repeat_var.get()))
+            except ValueError:
+                repeat = 1
+            new_action = {"type": "type_string", "text": text, "delay": max(0, delay), "repeat": repeat}
             if editing and existing.get("hotkey"):
                 new_action["hotkey"] = existing["hotkey"]
             if editing:

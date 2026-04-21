@@ -233,10 +233,17 @@ class InputSimulator:
             inp.union.ki.dwFlags = flags
             return inp
 
-        def send_and_log(vk: int, flags: int, label: str):
+        def send_and_log(vk: int, flags: int, label: str, use_scan: bool = False):
             scan = user32.MapVirtualKeyW(vk, 0)
-            log(f"  {label}: vk={hex(vk)} scan={hex(scan)} flags={hex(flags)}")
-            arr = (INPUT * 1)(ki(vk, flags))
+            actual_flags = flags | (KEYEVENTF_SCANCODE if use_scan else 0)
+            log(f"  {label}: vk={hex(vk)} scan={hex(scan)} flags={hex(actual_flags)}"
+                f"{'  (scan-mode)' if use_scan else ''}")
+            inp = INPUT()
+            inp.type = INPUT_KEYBOARD
+            inp.union.ki.wVk = 0 if use_scan else vk
+            inp.union.ki.wScan = scan
+            inp.union.ki.dwFlags = actual_flags
+            arr = (INPUT * 1)(inp)
             result = user32.SendInput(1, ctypes.pointer(arr), ctypes.sizeof(INPUT))
             log(f"    SendInput returned {result} (expected 1)")
 
@@ -245,7 +252,7 @@ class InputSimulator:
         log(f"  modifiers={[hex(v) for v in modifiers]}  main={hex(main)}")
 
         for vk in modifiers:
-            send_and_log(vk, 0, "MOD DOWN")
+            send_and_log(vk, 0, "MOD DOWN", use_scan=True)
             time.sleep(0.02)
 
         send_and_log(main, 0, "MAIN DOWN")
@@ -254,7 +261,7 @@ class InputSimulator:
         time.sleep(0.01)
 
         for vk in reversed(modifiers):
-            send_and_log(vk, KEYEVENTF_KEYUP, "MOD UP")
+            send_and_log(vk, KEYEVENTF_KEYUP, "MOD UP", use_scan=True)
             time.sleep(0.01)
 
         log("send_combo done")
@@ -1112,33 +1119,42 @@ class AutoMacroApp(ctk.CTk):
 
         ctk.CTkLabel(dlg, text="Press a key to assign, or clear:", font=("", 12)).pack(
             pady=(18, 6))
-        display_var = ctk.StringVar(value=current if current else "— none —")
+        display_var = ctk.StringVar(value="Listening...")
         ctk.CTkLabel(dlg, textvariable=display_var, font=("", 14, "bold")).pack(pady=4)
 
         captured = {"key": current}
+        listening = {"active": False}
 
         def start_capture():
-            display_var.set("Press any key...")
-            capture_btn.configure(state="disabled")
+            if listening["active"]:
+                return
+            listening["active"] = True
+            display_var.set("Listening...")
+            capture_btn.configure(text="Re-record", state="disabled")
 
             def poll():
-                time.sleep(0.15)
-                for name, vk in VK_MAP.items():
-                    if user32.GetAsyncKeyState(vk) & 0x8000:
-                        captured["key"] = name
-                        dlg.after(0, lambda n=name: display_var.set(n))
-                        dlg.after(0, lambda: capture_btn.configure(state="normal"))
-                        return
-                threading.Thread(target=poll, daemon=True).start()
+                time.sleep(0.2)
+                while listening["active"]:
+                    for name, vk in VK_MAP.items():
+                        if user32.GetAsyncKeyState(vk) & 0x8000:
+                            listening["active"] = False
+                            captured["key"] = name
+                            dlg.after(0, lambda n=name: display_var.set(n))
+                            dlg.after(0, lambda: capture_btn.configure(
+                                text="Re-record", state="normal"))
+                            return
+                    time.sleep(0.03)
 
             threading.Thread(target=poll, daemon=True).start()
 
         btn_row = ctk.CTkFrame(dlg, fg_color="transparent")
         btn_row.pack(pady=10)
 
-        capture_btn = ctk.CTkButton(btn_row, text="Record Key", width=110,
+        capture_btn = ctk.CTkButton(btn_row, text="Re-record", width=110,
                                      command=start_capture)
         capture_btn.pack(side="left", padx=4)
+
+        dlg.after(150, start_capture)
 
         def save():
             seq["hotkey"] = captured["key"]
@@ -1373,7 +1389,58 @@ class AutoMacroApp(ctk.CTk):
         ctk.CTkCheckBox(mod_frame, text="Shift", variable=shift_var).pack(side="left", padx=(0, 12))
         ctk.CTkCheckBox(mod_frame, text="Alt", variable=alt_var).pack(side="left")
 
-        ctk.CTkLabel(dlg, text="Main key:", anchor="w").pack(fill="x", padx=20, pady=(14, 4))
+        # Live combo capture
+        listen_var = ctk.StringVar(value="Listening...")
+        listen_lbl = ctk.CTkLabel(dlg, textvariable=listen_var, font=("", 12),
+                                   text_color="#4ade80")
+        listen_lbl.pack(pady=(10, 0))
+
+        listen_btn = ctk.CTkButton(dlg, text="Re-record", width=120)
+        listen_btn.pack(pady=(2, 4))
+
+        combo_listening = {"active": False}
+
+        def start_combo_listen():
+            if combo_listening["active"]:
+                return
+            combo_listening["active"] = True
+            listen_var.set("Listening...")
+            listen_btn.configure(state="disabled")
+
+            def poll():
+                time.sleep(0.2)
+                # wait for all keys to be released
+                while combo_listening["active"] and any(
+                        user32.GetAsyncKeyState(vk) & 0x8000 for vk in VK_MAP.values()):
+                    time.sleep(0.03)
+                while combo_listening["active"]:
+                    held_mods: set[str] = set()
+                    main_key = None
+                    for name, vk in VK_MAP.items():
+                        if user32.GetAsyncKeyState(vk) & 0x8000:
+                            nu = name.upper()
+                            if nu in _MODIFIER_NAMES:
+                                held_mods.add(nu)
+                            else:
+                                main_key = nu
+                    if main_key:
+                        combo_listening["active"] = False
+                        def apply(hm=held_mods, mk=main_key):
+                            ctrl_var.set(bool(hm & {"CTRL", "LCTRL", "RCTRL"}))
+                            shift_var.set(bool(hm & {"SHIFT", "LSHIFT", "RSHIFT"}))
+                            alt_var.set(bool(hm & {"ALT", "LALT", "RALT"}))
+                            main_var.set(mk)
+                            listen_btn.configure(state="normal")
+                        dlg.after(0, apply)
+                        return
+                    time.sleep(0.03)
+
+            threading.Thread(target=poll, daemon=True).start()
+
+        listen_btn.configure(command=start_combo_listen)
+        dlg.after(150, start_combo_listen)
+
+        ctk.CTkLabel(dlg, text="Main key:", anchor="w").pack(fill="x", padx=20, pady=(8, 4))
         main_var = ctk.StringVar(value=ex_main)
         ctk.CTkComboBox(dlg, values=ALL_KEY_NAMES, variable=main_var, width=280).pack(padx=20)
 

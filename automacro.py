@@ -1000,6 +1000,11 @@ class AutoMacroApp(ctk.CTk):
                            command=lambda idx=i: self._move_sequence(idx, 1)).pack(
                 side="left", padx=1)
 
+        ctk.CTkButton(row, text="\u2bcc", width=28, height=28,
+                       fg_color="#4a4a4a", hover_color="#5a5a5a",
+                       command=lambda idx=i: self._duplicate_sequence(idx)).pack(
+            side="left", padx=1)
+
         ctk.CTkButton(row, text="\u2715", width=28, height=28,
                        fg_color="#aa3333", hover_color="#cc4444",
                        command=lambda idx=i: self._delete_sequence(idx)).pack(
@@ -1033,6 +1038,14 @@ class AutoMacroApp(ctk.CTk):
             self.sequences[index], self.sequences[new_idx] = (
                 self.sequences[new_idx], self.sequences[index])
             self._refresh_seq_list()
+
+    def _duplicate_sequence(self, index: int):
+        import copy
+        dupe = copy.deepcopy(self.sequences[index])
+        dupe["name"] = dupe.get("name", f"Sequence {index+1}") + " (copy)"
+        dupe.pop("hotkey", None)  # don't duplicate hotkeys — two seqs can't share one
+        self.sequences.insert(index + 1, dupe)
+        self._refresh_seq_list()
 
     def _run_single_sequence(self, seq: dict):
         MacroEngine().start([seq], 1)

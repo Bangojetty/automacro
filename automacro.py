@@ -731,6 +731,11 @@ class AutoMacroApp(ctk.CTk):
         self.name_var = ctk.StringVar(value=self.macro_name)
         ctk.CTkEntry(name_row, textvariable=self.name_var, width=220).pack(side="left", padx=6)
 
+        # Default delay — top-right
+        ctk.CTkLabel(name_row, text="Default delay (ms):").pack(side="right", padx=(6, 0))
+        self.default_delay_var = ctk.StringVar(value="100")
+        ctk.CTkEntry(name_row, textvariable=self.default_delay_var, width=70).pack(side="right")
+
         ctk.CTkLabel(parent, text="Actions", font=("", 15, "bold"), anchor="w").pack(
             fill="x", padx=10, pady=(4, 2)
         )
@@ -972,6 +977,12 @@ class AutoMacroApp(ctk.CTk):
         self.actions.clear()
         self._refresh_action_list()
 
+    def _default_delay(self) -> int:
+        try:
+            return max(0, int(self.default_delay_var.get()))
+        except (ValueError, AttributeError):
+            return 100
+
     # ── Single-action trigger ────────────────────────────────────────────
 
     def _run_single_action(self, action: dict):
@@ -1119,7 +1130,7 @@ class AutoMacroApp(ctk.CTk):
         ctk.CTkEntry(dlg, textvariable=repeat_var, width=280).pack(padx=20, pady=4)
 
         ctk.CTkLabel(dlg, text="Delay after (ms):", anchor="w").pack(fill="x", padx=20)
-        delay_var = ctk.StringVar(value=str(existing.get("delay", 50)))
+        delay_var = ctk.StringVar(value=str(existing.get("delay", self._default_delay())))
         ctk.CTkEntry(dlg, textvariable=delay_var, width=280).pack(padx=20, pady=4)
 
         def submit():
@@ -1203,7 +1214,7 @@ class AutoMacroApp(ctk.CTk):
         ctk.CTkEntry(dlg, textvariable=repeat_var, width=200).pack(pady=5)
 
         ctk.CTkLabel(dlg, text="Delay after (ms):").pack()
-        delay_var = ctk.StringVar(value=str(existing.get("delay", 100)))
+        delay_var = ctk.StringVar(value=str(existing.get("delay", self._default_delay())))
         ctk.CTkEntry(dlg, textvariable=delay_var, width=200).pack(pady=5)
 
         def submit():
@@ -1282,7 +1293,7 @@ class AutoMacroApp(ctk.CTk):
         ctk.CTkEntry(dlg, textvariable=repeat_var, width=200).pack(pady=5)
 
         ctk.CTkLabel(dlg, text="Delay after (ms):").pack()
-        delay_var = ctk.StringVar(value=str(existing.get("delay", 200)))
+        delay_var = ctk.StringVar(value=str(existing.get("delay", self._default_delay())))
         ctk.CTkEntry(dlg, textvariable=delay_var, width=200).pack(pady=5)
 
         def submit():
@@ -1325,7 +1336,7 @@ class AutoMacroApp(ctk.CTk):
         ctk.CTkEntry(dlg, textvariable=repeat_var, width=200).pack(pady=5)
 
         ctk.CTkLabel(dlg, text="Delay (ms):").pack()
-        delay_var = ctk.StringVar(value=str(existing.get("delay", 500)))
+        delay_var = ctk.StringVar(value=str(existing.get("delay", self._default_delay())))
         ctk.CTkEntry(dlg, textvariable=delay_var, width=200).pack(pady=5)
 
         def submit():
@@ -1369,7 +1380,7 @@ class AutoMacroApp(ctk.CTk):
         ctk.CTkEntry(dlg, textvariable=repeat_var, width=200).pack(pady=5)
 
         ctk.CTkLabel(dlg, text="Delay after (ms):").pack()
-        delay_var = ctk.StringVar(value=str(existing.get("delay", 0)))
+        delay_var = ctk.StringVar(value=str(existing.get("delay", self._default_delay())))
         ctk.CTkEntry(dlg, textvariable=delay_var, width=200).pack(pady=5)
 
         def submit():

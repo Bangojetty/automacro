@@ -1115,7 +1115,6 @@ class AutoMacroApp(ctk.CTk):
 
     def _record_seq_hotkey(self, index: int):
         seq = self.sequences[index]
-        current = seq.get("hotkey", "")
 
         dlg = ctk.CTkToplevel(self)
         dlg.title("Sequence Hotkey")
@@ -1123,59 +1122,34 @@ class AutoMacroApp(ctk.CTk):
         dlg.transient(self)
         dlg.grab_set()
 
-        ctk.CTkLabel(dlg, text="Press a key to assign, or clear:", font=("", 12)).pack(
+        ctk.CTkLabel(dlg, text="Press a key to assign:", font=("", 12)).pack(
             pady=(18, 6))
         display_var = ctk.StringVar(value="Listening...")
         ctk.CTkLabel(dlg, textvariable=display_var, font=("", 14, "bold")).pack(pady=4)
 
-        captured = {"key": current}
-        listening = {"active": False}
-
-        def start_capture():
-            if listening["active"]:
-                return
-            listening["active"] = True
-            display_var.set("Listening...")
-            capture_btn.configure(text="Re-record", state="disabled")
-
-            def poll():
-                time.sleep(0.2)
-                while listening["active"]:
-                    for name, vk in VK_MAP.items():
-                        if user32.GetAsyncKeyState(vk) & 0x8000:
-                            listening["active"] = False
-                            captured["key"] = name
-                            dlg.after(0, lambda n=name: display_var.set(n))
-                            dlg.after(0, lambda: capture_btn.configure(
-                                text="Re-record", state="normal"))
-                            return
-                    time.sleep(0.03)
-
-            threading.Thread(target=poll, daemon=True).start()
-
-        btn_row = ctk.CTkFrame(dlg, fg_color="transparent")
-        btn_row.pack(pady=10)
-
-        capture_btn = ctk.CTkButton(btn_row, text="Re-record", width=110,
-                                     command=start_capture)
-        capture_btn.pack(side="left", padx=4)
-
-        dlg.after(150, start_capture)
-
-        def save():
-            seq["hotkey"] = captured["key"]
+        def clear():
+            seq.pop("hotkey", None)
             self._mark_dirty()
             self._refresh_seq_list()
             dlg.destroy()
 
-        def clear():
-            seq.pop("hotkey", None)
-            self._refresh_seq_list()
-            dlg.destroy()
+        ctk.CTkButton(dlg, text="Clear Hotkey", width=110,
+                       fg_color="#7a3333", hover_color="#aa4444",
+                       command=clear).pack(pady=(8, 16))
 
-        ctk.CTkButton(btn_row, text="Save", width=70, command=save).pack(side="left", padx=4)
-        ctk.CTkButton(btn_row, text="Clear", width=60, fg_color="#aa3333",
-                       hover_color="#cc4444", command=clear).pack(side="left", padx=4)
+        def poll():
+            time.sleep(0.2)
+            while True:
+                for name, vk in VK_MAP.items():
+                    if user32.GetAsyncKeyState(vk) & 0x8000:
+                        seq["hotkey"] = name
+                        self._mark_dirty()
+                        dlg.after(0, self._refresh_seq_list)
+                        dlg.after(0, dlg.destroy)
+                        return
+                time.sleep(0.03)
+
+        threading.Thread(target=poll, daemon=True).start()
 
     # ── Sequence Editor ──────────────────────────────────────────────────
 

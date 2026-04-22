@@ -20,6 +20,12 @@ import customtkinter as ctk
 from PIL import Image, ImageDraw, ImageTk
 from pynput import keyboard as pynput_kb, mouse as pynput_mouse
 
+try:
+    import tkinterdnd2 as _dnd
+    _HAS_DND = True
+except ImportError:
+    _HAS_DND = False
+
 # ─── Windows SendInput Structures ────────────────────────────────────────────
 
 INPUT_MOUSE = 0
@@ -746,7 +752,12 @@ class AutoMacroApp(ctk.CTk):
         self._seq_placeholder: ctk.CTkLabel | None = None
         self._actions_placeholder: ctk.CTkLabel | None = None
 
+        # Per-row widget refs for incremental updates
+        self._seq_row_refs: list[dict] = []
+
         self._build_ui()
+        if _HAS_DND:
+            _dnd.TkinterDnD._require(self)
         self._create_overlay()
         self._load_last_session()
         self._update_status("Stopped")
@@ -959,6 +970,7 @@ class AutoMacroApp(ctk.CTk):
         for w in self.seq_frame.winfo_children():
             w.destroy()
         self._seq_placeholder = None
+        self._seq_row_refs = []
         self._rebuild_seq_hotkeys()
 
         if not self.sequences:
@@ -976,8 +988,8 @@ class AutoMacroApp(ctk.CTk):
         row = ctk.CTkFrame(self.seq_frame)
         row.pack(fill="x", pady=2, padx=2)
 
-        ctk.CTkLabel(row, text=f"#{i+1}", width=30, font=("", 12, "bold")).pack(
-            side="left", padx=(5, 3))
+        num_lbl = ctk.CTkLabel(row, text=f"#{i+1}", width=30, font=("", 12, "bold"))
+        num_lbl.pack(side="left", padx=(5, 3))
 
         name = seq.get("name", f"Sequence {i+1}")
         name_cell = ctk.CTkFrame(row, fg_color="transparent")
@@ -1015,8 +1027,9 @@ class AutoMacroApp(ctk.CTk):
         name_entry.bind("<Escape>", _cancel_rename)
 
         n = len(seq.get("actions", []))
-        ctk.CTkLabel(row, text=f"{n} action{'s' if n != 1 else ''}",
-                      width=72, text_color="gray", font=("", 11)).pack(side="left")
+        count_lbl = ctk.CTkLabel(row, text=f"{n} action{'s' if n != 1 else ''}",
+                                  width=72, text_color="gray", font=("", 11))
+        count_lbl.pack(side="left")
 
         ctk.CTkButton(
             row, text="\u25b6", width=28, height=28,
@@ -1030,13 +1043,14 @@ class AutoMacroApp(ctk.CTk):
         ).pack(side="left", padx=1)
 
         hk = seq.get("hotkey", "")
-        ctk.CTkButton(
+        hk_btn = ctk.CTkButton(
             row, text=hk if hk else "+", width=46, height=28,
             fg_color="#2d5a2d" if hk else "#3a3a3a",
             hover_color="#3a7a3a" if hk else "#4a4a4a",
             font=("", 11),
             command=lambda idx=i: self._record_seq_hotkey(idx),
-        ).pack(side="left", padx=1)
+        )
+        hk_btn.pack(side="left", padx=1)
 
         if i > 0:
             ctk.CTkButton(row, text="\u25b2", width=28, height=28,
@@ -1057,6 +1071,11 @@ class AutoMacroApp(ctk.CTk):
                        command=lambda idx=i: self._delete_sequence(idx)).pack(
             side="left", padx=(1, 5))
 
+        self._seq_row_refs.append({
+            "frame": row, "num_lbl": num_lbl,
+            "name_lbl": name_lbl, "count_lbl": count_lbl, "hk_btn": hk_btn,
+        })
+
     def _append_seq_row(self, seq: dict):
         i = len(self.sequences) - 1
         if self._seq_placeholder is not None:
@@ -1066,6 +1085,15 @@ class AutoMacroApp(ctk.CTk):
         hid = self.seq_hotkey_mgr.register(hk, lambda s=seq: self._run_single_sequence(s)) if hk else -1
         self._seq_hids.append(hid)
         self._build_seq_row(i, seq)
+
+    def _update_seq_row_display(self, i: int):
+        if i >= len(self._seq_row_refs) or i >= len(self.sequences):
+            return
+        refs = self._seq_row_refs[i]
+        seq = self.sequences[i]
+        refs["name_lbl"].configure(text=seq.get("name", f"Sequence {i+1}"))
+        n = len(seq.get("actions", []))
+        refs["count_lbl"].configure(text=f"{n} action{'s' if n != 1 else ''}")
 
     def _add_sequence(self):
         idx = len(self.sequences)
@@ -1127,10 +1155,22 @@ class AutoMacroApp(ctk.CTk):
         display_var = ctk.StringVar(value="Listening...")
         ctk.CTkLabel(dlg, textvariable=display_var, font=("", 14, "bold")).pack(pady=4)
 
+        def _apply_hk_update():
+            self._rebuild_seq_hotkeys()
+            if index < len(self._seq_row_refs):
+                hk2 = seq.get("hotkey", "")
+                self._seq_row_refs[index]["hk_btn"].configure(
+                    text=hk2 if hk2 else "+",
+                    fg_color="#2d5a2d" if hk2 else "#3a3a3a",
+                    hover_color="#3a7a3a" if hk2 else "#4a4a4a",
+                )
+            else:
+                self._refresh_seq_list()
+
         def clear():
             seq.pop("hotkey", None)
             self._mark_dirty()
-            self._refresh_seq_list()
+            _apply_hk_update()
             dlg.destroy()
 
         ctk.CTkButton(dlg, text="Clear Hotkey", width=110,
@@ -1144,7 +1184,7 @@ class AutoMacroApp(ctk.CTk):
                     if user32.GetAsyncKeyState(vk) & 0x8000:
                         seq["hotkey"] = name
                         self._mark_dirty()
-                        dlg.after(0, self._refresh_seq_list)
+                        dlg.after(0, _apply_hk_update)
                         dlg.after(0, dlg.destroy)
                         return
                 time.sleep(0.03)
@@ -1163,11 +1203,15 @@ class AutoMacroApp(ctk.CTk):
         self._refresh_action_list()
 
     def _back_to_seq_list(self):
-        if self._editing_seq_index is not None:
+        edited_idx = self._editing_seq_index
+        if edited_idx is not None:
             self._save_seq_edits()
         self._editing_seq_index = None
         self._show_seq_list_panel()
-        self._refresh_seq_list()
+        if edited_idx is not None and edited_idx < len(self._seq_row_refs):
+            self._update_seq_row_display(edited_idx)
+        else:
+            self._refresh_seq_list()
 
     def _save_seq_edits(self):
         idx = self._editing_seq_index
@@ -1768,8 +1812,16 @@ class AutoMacroApp(ctk.CTk):
         ctk.CTkButton(header, text="Save Current", width=120,
                        command=self._save_preset).pack(side="right")
 
+        if _HAS_DND:
+            ctk.CTkLabel(parent, text="Drop .json preset files here to import",
+                          text_color="gray", font=("", 11)).pack(pady=(0, 4))
+
         self.preset_frame = ctk.CTkScrollableFrame(parent)
         self.preset_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        if _HAS_DND:
+            self.preset_frame.drop_target_register(_dnd.DND_FILES)
+            self.preset_frame.dnd_bind("<<Drop>>", self._on_preset_drop)
 
     def _refresh_presets(self):
         for w in self.preset_frame.winfo_children():
@@ -1816,6 +1868,19 @@ class AutoMacroApp(ctk.CTk):
     def _delete_preset(self, path: Path):
         path.unlink(missing_ok=True)
         self._refresh_presets()
+
+    def _on_preset_drop(self, event):
+        import shutil
+        files = self.tk.splitlist(event.data)
+        imported = 0
+        for f in files:
+            p = Path(f)
+            if p.suffix.lower() == ".json" and p.exists():
+                dest = self.PRESETS_DIR / p.name
+                shutil.copy2(str(p), str(dest))
+                imported += 1
+        if imported:
+            self._refresh_presets()
 
     def _apply_macro_data(self, data: dict):
         self._editing_seq_index = None

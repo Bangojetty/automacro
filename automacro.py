@@ -1715,6 +1715,9 @@ class AutoMacroApp(ctk.CTk):
         text_box = ctk.CTkTextbox(dlg, width=340, height=80)
         text_box.pack(pady=5, padx=20)
         text_box.insert("0.0", existing.get("text", ""))
+        text_box.focus_set()
+        if existing.get("text"):
+            text_box.tag_add("sel", "0.0", "end")
 
         ctk.CTkLabel(dlg, text="Repeat:").pack()
         repeat_var = ctk.StringVar(value=str(existing.get("repeat", 1)))

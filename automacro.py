@@ -1552,6 +1552,7 @@ class AutoMacroApp(ctk.CTk):
             threading.Thread(target=poll, daemon=True).start()
 
         record_btn.configure(command=start_key_capture)
+        dlg.after(150, start_key_capture)
 
         ctk.CTkLabel(dlg, text="Action:").pack()
         action_var = ctk.StringVar(value=existing.get("action", "tap"))

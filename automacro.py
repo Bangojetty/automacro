@@ -733,6 +733,7 @@ class AutoMacroApp(ctk.CTk):
         self._recording_hotkey = False
         self._input_recording = False
         self._macro_locked = False
+        self._dirty = False
 
         self.engine = MacroEngine(on_status=self._on_engine_status,
                                    on_action=self._on_engine_action)
@@ -1000,6 +1001,7 @@ class AutoMacroApp(ctk.CTk):
             if new_name:
                 s["name"] = new_name
                 lbl.configure(text=new_name)
+                self._mark_dirty()
             ent.pack_forget()
             lbl.pack(fill="x", expand=True, padx=2)
 
@@ -1071,10 +1073,12 @@ class AutoMacroApp(ctk.CTk):
                    "delay": 0, "actions": []}
         self.sequences.append(new_seq)
         self._append_seq_row(new_seq)
+        self._mark_dirty()
         self._open_seq_editor(idx)
 
     def _delete_sequence(self, index: int):
         self.sequences.pop(index)
+        self._mark_dirty()
         self._refresh_seq_list()
 
     def _move_sequence(self, index: int, direction: int):
@@ -1082,6 +1086,7 @@ class AutoMacroApp(ctk.CTk):
         if 0 <= new_idx < len(self.sequences):
             self.sequences[index], self.sequences[new_idx] = (
                 self.sequences[new_idx], self.sequences[index])
+            self._mark_dirty()
             self._refresh_seq_list()
 
     def _duplicate_sequence(self, index: int):
@@ -1090,6 +1095,7 @@ class AutoMacroApp(ctk.CTk):
         dupe["name"] = dupe.get("name", f"Sequence {index+1}") + " (copy)"
         dupe.pop("hotkey", None)  # don't duplicate hotkeys — two seqs can't share one
         self.sequences.insert(index + 1, dupe)
+        self._mark_dirty()
         self._refresh_seq_list()
 
     def _run_single_sequence(self, seq: dict):
@@ -1158,6 +1164,7 @@ class AutoMacroApp(ctk.CTk):
 
         def save():
             seq["hotkey"] = captured["key"]
+            self._mark_dirty()
             self._refresh_seq_list()
             dlg.destroy()
 
@@ -1201,6 +1208,7 @@ class AutoMacroApp(ctk.CTk):
             self.sequences[idx]["delay"] = max(0, int(self.seq_delay_var.get()))
         except ValueError:
             self.sequences[idx]["delay"] = 0
+        self._mark_dirty()
 
     @property
     def _current_actions(self) -> list[dict]:
@@ -1238,6 +1246,7 @@ class AutoMacroApp(ctk.CTk):
         def _on_rep_change(name, index, mode, a=action, v=rep_var):
             try:
                 a["repeat"] = max(1, int(v.get()))
+                self._mark_dirty()
             except ValueError:
                 pass
 
@@ -1308,15 +1317,18 @@ class AutoMacroApp(ctk.CTk):
         new_idx = index + direction
         if 0 <= new_idx < len(actions):
             actions[index], actions[new_idx] = actions[new_idx], actions[index]
+            self._mark_dirty()
             self._refresh_action_list()
 
     def _delete_action(self, index: int):
         self._current_actions.pop(index)
+        self._mark_dirty()
         self._refresh_action_list()
 
     def _clear_actions(self):
         if self._editing_seq_index is not None and self._editing_seq_index < len(self.sequences):
             self.sequences[self._editing_seq_index]["actions"].clear()
+        self._mark_dirty()
         self._refresh_action_list()
 
     def _default_delay(self) -> int:
@@ -1498,9 +1510,11 @@ class AutoMacroApp(ctk.CTk):
             else:
                 self._current_actions.append(new_action)
                 self._append_action_row(new_action)
+            self._mark_dirty()
             dlg.destroy()
 
         ctk.CTkButton(dlg, text="Save" if editing else "Add", command=submit).pack(pady=10)
+        dlg.bind("<Return>", lambda e: submit())
 
     def _dlg_add_key(self, edit_index: int | None = None):
         editing = edit_index is not None
@@ -1573,9 +1587,11 @@ class AutoMacroApp(ctk.CTk):
             else:
                 self._current_actions.append(new_action)
                 self._append_action_row(new_action)
+            self._mark_dirty()
             dlg.destroy()
 
         ctk.CTkButton(dlg, text="Save" if editing else "Add", command=submit).pack(pady=10)
+        dlg.bind("<Return>", lambda e: submit())
 
     def _dlg_add_click(self, edit_index: int | None = None):
         editing = edit_index is not None
@@ -1646,9 +1662,11 @@ class AutoMacroApp(ctk.CTk):
             else:
                 self._current_actions.append(new_action)
                 self._append_action_row(new_action)
+            self._mark_dirty()
             dlg.destroy()
 
         ctk.CTkButton(dlg, text="Save" if editing else "Add", command=submit).pack(pady=10)
+        dlg.bind("<Return>", lambda e: submit())
 
     def _dlg_add_delay(self, edit_index: int | None = None):
         editing = edit_index is not None
@@ -1680,9 +1698,11 @@ class AutoMacroApp(ctk.CTk):
             else:
                 self._current_actions.append(new_action)
                 self._append_action_row(new_action)
+            self._mark_dirty()
             dlg.destroy()
 
         ctk.CTkButton(dlg, text="Save" if editing else "Add", command=submit).pack(pady=10)
+        dlg.bind("<Return>", lambda e: submit())
 
     def _dlg_add_string(self, edit_index: int | None = None):
         editing = edit_index is not None
@@ -1721,6 +1741,7 @@ class AutoMacroApp(ctk.CTk):
             else:
                 self._current_actions.append(new_action)
                 self._append_action_row(new_action)
+            self._mark_dirty()
             dlg.destroy()
 
         ctk.CTkButton(dlg, text="Save" if editing else "Add", command=submit).pack(pady=8)
@@ -1757,6 +1778,7 @@ class AutoMacroApp(ctk.CTk):
         if self._editing_seq_index is None:
             return
         self._current_actions.append(action)
+        self._mark_dirty()
         self._append_action_row(action)
 
     # ── Presets ──────────────────────────────────────────────────────────
@@ -1805,6 +1827,7 @@ class AutoMacroApp(ctk.CTk):
             "sequences": self.sequences,
         }
         path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        self._mark_clean()
         self._switch_tab("presets")
 
     def _load_preset_file(self, path: Path):
@@ -1850,6 +1873,7 @@ class AutoMacroApp(ctk.CTk):
         self._on_infinite_toggle()
 
         self._refresh_seq_list()
+        self._mark_clean()
 
     # ── Controls ─────────────────────────────────────────────────────────
 
@@ -1901,6 +1925,7 @@ class AutoMacroApp(ctk.CTk):
         self.start_btn.configure(text=f"Start ({name})")
         if self.hotkey_enabled_var.get():
             self.hotkey_mgr.set_hotkey(name)
+        self._mark_dirty()
 
     def _on_engine_status(self, status: str):
         self.after(0, self._update_status, status)
@@ -2048,7 +2073,13 @@ class AutoMacroApp(ctk.CTk):
                 pass
         self._refresh_seq_list()
 
-    def _on_close(self):
+    def _mark_dirty(self):
+        self._dirty = True
+
+    def _mark_clean(self):
+        self._dirty = False
+
+    def _do_close(self):
         self._save_last_session()
         self.engine.stop()
         self.hotkey_mgr.stop()
@@ -2057,6 +2088,61 @@ class AutoMacroApp(ctk.CTk):
         if hasattr(self, "_overlay"):
             self._overlay.destroy()
         self.destroy()
+
+    def _on_close(self):
+        if not self._dirty:
+            self._do_close()
+            return
+
+        dlg = ctk.CTkToplevel(self)
+        dlg.title("Unsaved Changes")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.lift()
+        dlg.focus_force()
+
+        name = self.name_var.get().strip() or "Untitled"
+        ctk.CTkLabel(dlg, text=f'Save changes to "{name}" before closing?',
+                      font=("", 13)).pack(pady=(24, 16), padx=24)
+
+        btn_row = ctk.CTkFrame(dlg, fg_color="transparent")
+        btn_row.pack(pady=(0, 20), padx=24)
+
+        def do_save():
+            dlg.destroy()
+            self._quick_save()
+            self._do_close()
+
+        def do_discard():
+            dlg.destroy()
+            self._do_close()
+
+        ctk.CTkButton(btn_row, text="Save", width=90,
+                       command=do_save).pack(side="left", padx=4)
+        ctk.CTkButton(btn_row, text="Don't Save", width=100,
+                       fg_color="#7a3333", hover_color="#aa4444",
+                       command=do_discard).pack(side="left", padx=4)
+        ctk.CTkButton(btn_row, text="Cancel", width=80,
+                       fg_color="transparent", border_width=1,
+                       command=dlg.destroy).pack(side="left", padx=4)
+
+    def _quick_save(self):
+        if self._editing_seq_index is not None:
+            self._save_seq_edits()
+        name = self.name_var.get().strip() or "Untitled"
+        safe = "".join(c if c.isalnum() or c in " _-" else "_" for c in name)
+        path = self.PRESETS_DIR / f"{safe}.json"
+        repeat = 0 if self.infinite_var.get() else int(self.repeat_var.get() or 1)
+        data = {
+            "name": name,
+            "hotkey": self.hotkey,
+            "hotkey_enabled": self.hotkey_enabled_var.get(),
+            "repeat": repeat,
+            "sequences": self.sequences,
+        }
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        self._mark_clean()
 
 
 # ─── Entry Point ─────────────────────────────────────────────────────────────
